@@ -17,13 +17,13 @@ Notes = [
 ]
 
 def search_notes(query: str) -> list[dict]:
-    query = query.lower()
+    query = query.strip().lower()
 
     result = []
-    
+
     for note in Notes:
-        if note["title"].lower().find(query) or note["content"].lower().find(query) is not -1:
-            result.append(note)
+        if query in note["title"].lower() or query in note["content"].lower():
+            result.append({"id": note["id"], "title": note["title"]})
 
     return result
 
