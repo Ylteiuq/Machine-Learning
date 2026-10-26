@@ -43,6 +43,19 @@ def request_llm(messages: list[dict], tools=None) -> dict:
     with urllib.request.urlopen(request, timeout=60) as response:
         return json.load(response)
 
+def find_tool_schemas(tool_name: str, tools: None) -> dict:
+    for tool in tools:
+        if tool_name == tool["function"]["name"]:
+            parameters = tool["function"]["parameters"]
+
+            return {
+                "requires": parameters.get("required",[]),
+                "properties": parameters.get("properties", {}),
+                "addtional_properties": parameters.get("additionalProperties", True)
+            }
+
+    raise ValueError(f"找不到对应tool: {tool_name}")
+
 def execute_tool(tool_call: dict) -> dict:
     """执行一次工具请求，返回可追加到 messages 的工具消息。"""
 
@@ -56,15 +69,23 @@ def execute_tool(tool_call: dict) -> dict:
         if not isinstance(tool_arguments, str):
             raise ValueError("工具参数必须是 JSON 字符串")
 
+        tool_find = find_tool_schemas(tool_name, tools.TOOL_SCHEMAS)
+
         arguments = json.loads(tool_arguments)
-        if not isinstance(arguments, dict):
-            raise ValueError("工具参数必须解析为一个对象")
-        # 当前只有 search_notes；后续增加工具时再扩展各自的参数校验。
-        if set(arguments) != {"query"}:
-            raise ValueError("参数必须且只能包含 query 字段")
-        query = arguments["query"]
-        if not isinstance(query, str) or not query.strip():
-            raise ValueError("query 必须是非空字符串")
+        for filed in tool_find["tool_arguments"]:
+            if filed not in arguments:
+                raise ValueError(f"缺少必填参数 {filed}")
+
+            value = arguments[filed]
+
+            if value is None or (isinstance(value, str) and not value.strip()):
+                raise ValueError(f"参数 {filed} 不能为空")
+
+        if tool_find["additional_properties"] is False:
+            extra_fields = set(arguments) - set(tool_find["properties"])
+
+            if extra_fields:
+                raise ValueError(f"存在不允许的参数： {', '.join(sorted(extra_fields))}")
     except json.JSONDecodeError:
         result = {"ok": False, "error": "工具参数不是有效的 JSON"}
     except ValueError as error:
@@ -83,6 +104,24 @@ def execute_tool(tool_call: dict) -> dict:
         "content": json.dumps(result, ensure_ascii=False),
     }
 
+def run_agent(messages: list[dict], max_steps: int = 6) -> dict:
+    for i in range(max_steps):
+        response = request_llm(messages, tools.TOOL_SCHEMAS)
+        message = response["choice"][0]["message"]
+
+        messages.append(message)
+
+        print(response["chioce"][0]["finish_reason"], response["usage"])
+
+        tool_calls = message.get("tool_calls") or []
+
+        if not tool_calls:
+            return messages
+
+        for tool_call in tool_calls:
+            print("调用工具：", tool_call["function"]["name"], tool_call["function"]["arguments"])
+            messages.append(execute_tool(tool_call))
+
 def main() -> None:
     messages = [
         {
@@ -95,37 +134,12 @@ def main() -> None:
         }
     ]
 
-    first_response = request_llm(messages, tools.TOOL_SCHEMAS)
-    first_message = first_response["choices"][0]["message"]
-
-    # 保留完整的 tool_calls，后续工具结果才能与调用请求配对。
-    messages.append(first_message)
-
-    tool_calls = first_message.get("tool_calls") or []
-
-    if not tool_calls:
-        for message in messages:
-            print(message["role"], message["content"])
-        print(first_response["choices"][0]["finish_reason"], first_response["usage"])
-
-        return
-
-    for tool_call in tool_calls:
-        print("调用工具：", tool_call["function"]["name"], tool_call["function"]["arguments"])
-        messages.append(execute_tool(tool_call))
-
-    second_response = request_llm(messages)
-    second_message = second_response["choices"][0]["message"]
-
-    messages.append(second_message)
+    messages = run_agent(messages, 6)
 
     for message in messages:
         if message.get("tool_calls"):
             continue  # 工具请求已在执行时打印。
         print(message["role"], message["content"])
-
-    print(first_response["choices"][0]["finish_reason"], first_response["usage"])
-    print(second_response["choices"][0]["finish_reason"], second_response["usage"])
 
 if __name__ == "__main__":
     main()
