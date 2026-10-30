@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 
 import tools
 import memory
+import context
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
@@ -123,7 +124,7 @@ def run_agent(messages: list[dict], max_steps: int = 6) -> tuple[AgentStatus, li
 
     try:
         for step in range(1, max_steps + 1):
-            response = request_llm(messages, tools.TOOL_SCHEMAS)
+            response = request_llm(context.build_context(messages), tools.TOOL_SCHEMAS)
             choice = response["choices"][0]
             message = choice["message"]
             finish_reason = choice["finish_reason"]

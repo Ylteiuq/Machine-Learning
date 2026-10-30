@@ -34,6 +34,29 @@ def model_response(content=None, calls=None, reason="stop"):
 
 
 class AgentTests(unittest.TestCase):
+    def test_context_keeps_whole_turns_without_changing_history(self):
+        messages = [{"role": "system", "content": "学习笔记助手"}]
+        for turn in range(1, 4):
+            messages.extend([
+                {"role": "user", "content": f"第 {turn} 个问题"},
+                {"role": "assistant", "content": f"第 {turn} 个回答"},
+            ])
+
+        context = agent.context.build_context(messages)
+        self.assertEqual(context, messages)
+        self.assertIsNot(context, messages)
+
+        call = tool_call("read_notes", {"note_id": "n1"})
+        messages.extend([
+            {"role": "user", "content": "读取 Attention 笔记"},
+            {"role": "assistant", "content": None, "tool_calls": [call]},
+            agent.execute_tool(call),
+        ])
+        original = copy.deepcopy(messages)
+        context = agent.context.build_context(messages)
+        self.assertEqual(context, [messages[0]] + messages[3:])
+        self.assertEqual(messages, original)
+
     def run_script(self, responses, max_steps=6):
         """按给定顺序返回模型响应，记录每次请求时的历史快照。"""
         script = iter(responses)
