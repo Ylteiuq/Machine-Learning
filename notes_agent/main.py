@@ -7,6 +7,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 import tools
+import memory
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
@@ -24,7 +25,7 @@ def request_llm(messages: list[dict], tools=None) -> dict:
         "messages": messages,
         "stream": False,
         "thinking": {"type": "disabled"},
-        "max_tokens": 512,
+        "max_tokens": 2048,
     }
 
     # 先补齐请求体，再编码；编码后的 body 不会随 payload 的修改而变化。
@@ -159,33 +160,42 @@ def run_agent(messages: list[dict], max_steps: int = 6) -> tuple[AgentStatus, li
         return AgentStatus.INCOMPLETE, messages
 
 def main() -> None:
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "你是学习笔记助手，使用简洁的中文回答。先搜索本地笔记获取编号；"
-                "回答笔记的具体内容前，使用 read_notes 读取正文。"
-                "依据工具结果回答并标注笔记编号；没有找到时明确说明。"
-            )
-        },
-        {
+    messages = memory.load_messages()
+    if not messages:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "你是学习笔记助手，使用简洁的中文回答。先搜索本地笔记获取编号；"
+                    "回答笔记的具体内容前，使用 read_notes 读取正文。"
+                    "依据工具结果回答并标注笔记编号；没有找到时明确说明。"
+                )
+            }
+        ]
+
+    while True:
+        question = input("请输入问题（输入 exit 退出）：").strip()
+        if not question:
+            continue
+        if question == "exit":
+            break
+        message = {
             "role": "user",
-            "content": "找出关于 Attention 的笔记，读取正文，解释 Q、K、V 分别是什么，并标注笔记编号。"
+            "content": question
         }
-    ]
-    status, messages = run_agent(messages, 6)
+        messages.append(message)
 
-    if status == AgentStatus.COMPLETE:
-        print("Agent 正常完成")
-    elif status == AgentStatus.INCOMPLETE:
-        print("Agent 生成未完成或运行失败")
-    elif status == AgentStatus.MAX_STEPS:
-        print("达到最大模型调用次数，Agent 已停止，任务尚未完成")
+        status, messages = run_agent(messages, 6)
 
-    for message in messages:
-        if message.get("tool_calls"):
-            continue  # 工具请求已在执行时打印。
-        print(message["role"], message["content"])
+        if status == AgentStatus.COMPLETE:
+            print(messages[-1]["role"], messages[-1]["content"])
+            memory.save_messages(messages)
+        elif status == AgentStatus.INCOMPLETE:
+            print("Agent 生成未完成或运行失败")
+            break
+        elif status == AgentStatus.MAX_STEPS:
+            print("达到最大模型调用次数，Agent 已停止，任务尚未完成")
+            break
 
 if __name__ == "__main__":
     main()

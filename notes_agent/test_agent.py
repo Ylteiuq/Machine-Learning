@@ -5,8 +5,10 @@ import inspect
 import io
 import json
 import os
+import tempfile
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 from unittest.mock import patch
 
 import main as agent
@@ -174,6 +176,7 @@ class AgentTests(unittest.TestCase):
             model_response(calls=[tool_call("search_notes", {"query": "Attention"})], reason="tool_calls"),
             model_response(calls=[tool_call("read_notes", {"note_id": "n1"})], reason="tool_calls"),
             model_response("根据 n1，Q 表示查询。"),
+            model_response("Q 就是用来查找信息的查询。"),
         ])
         payloads = []
 
@@ -188,13 +191,26 @@ class AgentTests(unittest.TestCase):
                     "LLM_MODEL": "local-test-model"}
         output = io.StringIO()
         with patch.dict(os.environ, settings, clear=True), patch("urllib.request.urlopen", side_effect=fake_urlopen):
-            with redirect_stdout(output):
-                agent.main()
-        self.assertEqual(len(payloads), 3)
+            with tempfile.TemporaryDirectory() as directory, patch.object(
+                agent.memory, "SESSION_FILE", Path(directory) / "session.json"
+            ):
+                self.assertEqual(agent.memory.load_messages(), [])
+                with redirect_stdout(output), patch("builtins.input", side_effect=[
+                    "   ", "查找并读取 Attention 笔记", "exit", "把刚才的解释缩短成一句话", "exit"
+                ]):
+                    agent.main()
+                    saved_messages = agent.memory.load_messages()
+                    self.assertEqual(saved_messages, payloads[-1]["messages"] + [
+                        {"role": "assistant", "content": "根据 n1，Q 表示查询。"}
+                    ])
+                    agent.main()
+                self.assertEqual(agent.memory.load_messages()[-1]["content"], "Q 就是用来查找信息的查询。")
+        self.assertEqual(len(payloads), 4)
         self.assertTrue(all(payload["tools"] == tools.TOOL_SCHEMAS for payload in payloads))
-        self.assertEqual([len(payload["messages"]) for payload in payloads], [2, 4, 6])
-        self.assertIn("Agent 正常完成", output.getvalue())
+        self.assertEqual([len(payload["messages"]) for payload in payloads], [2, 4, 6, 8])
+        self.assertEqual(payloads[-1]["messages"][-2]["content"], "根据 n1，Q 表示查询。")
         self.assertIn("根据 n1", output.getvalue())
+        self.assertIn("Q 就是用来查找信息的查询。", output.getvalue())
 
 
 if __name__ == "__main__":
