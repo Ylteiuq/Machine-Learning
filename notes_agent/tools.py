@@ -30,7 +30,7 @@ def search_notes(query: str) -> list[dict]:
 def read_notes(note_id: str) -> dict:
     for note in Notes:
         if note["id"] == note_id:
-            return note
+            return note.copy()
 
     raise ValueError(f"未查询到对应的id: {note_id}")
 
@@ -39,7 +39,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "search_notes",
-            "description": "按关键词搜索本地笔记的标题和正文，返回匹配笔记的编号和标题。",
+            "description": "按关键词搜索本地笔记的标题和正文，只返回编号和标题；需要正文时继续调用 read_notes。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -57,11 +57,11 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "read_notes",
-            "description": "按id检索本地笔记，返回对应的编号标题以及内容。",
+            "description": "根据搜索结果中的笔记编号读取一篇本地笔记，返回编号、标题和完整正文。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {
+                    "note_id": {
                         "type": "string",
                         "description": "搜索对应id，如 n1",
                     }

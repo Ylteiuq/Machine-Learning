@@ -1,8 +1,14 @@
 import os
 import json
 import urllib.request
+from enum import Enum, auto
+from pathlib import Path
+
+from dotenv import load_dotenv
 
 import tools
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 def request_llm(messages: list[dict], tools=None) -> dict:
     api_key = os.getenv("LLM_API_KEY")
@@ -43,16 +49,11 @@ def request_llm(messages: list[dict], tools=None) -> dict:
     with urllib.request.urlopen(request, timeout=60) as response:
         return json.load(response)
 
-def find_tool_schemas(tool_name: str, tools: None) -> dict:
-    for tool in tools:
+def find_tool_schemas(tool_name: str, tool_schemas: list[dict]) -> dict:
+    """返回工具原始的参数描述，保持与发送给模型的字段名一致。"""
+    for tool in tool_schemas:
         if tool_name == tool["function"]["name"]:
-            parameters = tool["function"]["parameters"]
-
-            return {
-                "requires": parameters.get("required",[]),
-                "properties": parameters.get("properties", {}),
-                "addtional_properties": parameters.get("additionalProperties", True)
-            }
+            return tool["function"]["parameters"]
 
     raise ValueError(f"找不到对应tool: {tool_name}")
 
@@ -69,33 +70,38 @@ def execute_tool(tool_call: dict) -> dict:
         if not isinstance(tool_arguments, str):
             raise ValueError("工具参数必须是 JSON 字符串")
 
-        tool_find = find_tool_schemas(tool_name, tools.TOOL_SCHEMAS)
-
+        parameters = find_tool_schemas(tool_name, tools.TOOL_SCHEMAS)
         arguments = json.loads(tool_arguments)
-        for filed in tool_find["tool_arguments"]:
-            if filed not in arguments:
-                raise ValueError(f"缺少必填参数 {filed}")
+        if not isinstance(arguments, dict):
+            raise ValueError("工具参数必须解析为一个对象")
 
-            value = arguments[filed]
+        required = parameters.get("required", [])
+        properties = parameters.get("properties", {})
+        missing_fields = set(required) - set(arguments)
+        if missing_fields:
+            raise ValueError(f"缺少必填参数：{', '.join(sorted(missing_fields))}")
 
-            if value is None or (isinstance(value, str) and not value.strip()):
-                raise ValueError(f"参数 {filed} 不能为空")
-
-        if tool_find["additional_properties"] is False:
-            extra_fields = set(arguments) - set(tool_find["properties"])
-
+        if parameters.get("additionalProperties", True) is False:
+            extra_fields = set(arguments) - set(properties)
             if extra_fields:
-                raise ValueError(f"存在不允许的参数： {', '.join(sorted(extra_fields))}")
-    except json.JSONDecodeError:
-        result = {"ok": False, "error": "工具参数不是有效的 JSON"}
-    except ValueError as error:
-        result = {"ok": False, "error": str(error)}
-    else:
+                raise ValueError(f"存在不允许的参数：{', '.join(sorted(extra_fields))}")
+
+        # 这里只校验当前两个工具用到的字符串参数，并非完整的 JSON Schema 校验器。
+        for field, value in arguments.items():
+            if properties.get(field, {}).get("type") == "string":
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(f"参数 {field} 必须是非空字符串")
+
+        # 实际调用也放在 try 中，read_notes 抛出的业务错误才能回传给模型。
         func = tools.TOOL_HANDLERS[tool_name]
         result = {
             "ok": True,
             "data": func(**arguments),
         }
+    except json.JSONDecodeError:
+        result = {"ok": False, "error": "工具参数不是有效的 JSON"}
+    except ValueError as error:
+        result = {"ok": False, "error": str(error)}
 
     # 成功与失败都作为工具结果回传，并关联到原始调用编号。
     return {
@@ -104,37 +110,77 @@ def execute_tool(tool_call: dict) -> dict:
         "content": json.dumps(result, ensure_ascii=False),
     }
 
-def run_agent(messages: list[dict], max_steps: int = 6) -> dict:
-    for i in range(max_steps):
-        response = request_llm(messages, tools.TOOL_SCHEMAS)
-        message = response["choice"][0]["message"]
+class AgentStatus(Enum):
+    COMPLETE = auto()
+    MAX_STEPS = auto()
+    INCOMPLETE = auto()
 
-        messages.append(message)
+def run_agent(messages: list[dict], max_steps: int = 6) -> tuple[AgentStatus, list[dict]]:
+    """维护传入的消息历史；max_steps 限制模型调用次数，而非工具调用次数。"""
+    if type(max_steps) is not int or max_steps < 1:
+        raise ValueError("max_steps 必须是正整数")
 
-        print(response["chioce"][0]["finish_reason"], response["usage"])
+    try:
+        for step in range(1, max_steps + 1):
+            response = request_llm(messages, tools.TOOL_SCHEMAS)
+            choice = response["choices"][0]
+            message = choice["message"]
+            finish_reason = choice["finish_reason"]
 
-        tool_calls = message.get("tool_calls") or []
+            messages.append(message)
 
-        if not tool_calls:
-            return messages
+            print(f"第 {step} 次模型调用：", finish_reason, response.get("usage", {}))
 
-        for tool_call in tool_calls:
-            print("调用工具：", tool_call["function"]["name"], tool_call["function"]["arguments"])
-            messages.append(execute_tool(tool_call))
+            # 被截断或异常终止的响应不能算完成，也不能执行其中可能残缺的工具请求。
+            if finish_reason not in {"stop", "tool_calls"}:
+                print(f"模型未正常完成生成：{finish_reason}")
+                return AgentStatus.INCOMPLETE, messages
+
+            tool_calls = message.get("tool_calls") or []
+
+            if not tool_calls:
+                if finish_reason == "stop":
+                    return AgentStatus.COMPLETE, messages
+                print("模型声明要调用工具，但没有返回工具请求")
+                return AgentStatus.INCOMPLETE, messages
+
+            if finish_reason != "tool_calls":
+                print("模型的停止原因与工具请求不一致")
+                return AgentStatus.INCOMPLETE, messages
+
+            for tool_call in tool_calls:
+                print("调用工具：", tool_call["function"]["name"], tool_call["function"]["arguments"])
+                messages.append(execute_tool(tool_call))
+
+        return AgentStatus.MAX_STEPS, messages
+    except Exception as error:
+        # 工具的预期业务错误已转成 tool 消息；其余运行失败在任务边界终止。
+        print(f"Agent 运行失败（{type(error).__name__}）：{error}")
+        return AgentStatus.INCOMPLETE, messages
 
 def main() -> None:
     messages = [
         {
             "role": "system",
-            "content": "你是学习笔记助手，使用简洁的中文回答。查询本地笔记时先调用工具，依据工具结果回答；没有找到时明确说明。"
+            "content": (
+                "你是学习笔记助手，使用简洁的中文回答。先搜索本地笔记获取编号；"
+                "回答笔记的具体内容前，使用 read_notes 读取正文。"
+                "依据工具结果回答并标注笔记编号；没有找到时明确说明。"
+            )
         },
         {
             "role": "user",
-            "content": "搜索 Attention 笔记"
+            "content": "找出关于 Attention 的笔记，读取正文，解释 Q、K、V 分别是什么，并标注笔记编号。"
         }
     ]
+    status, messages = run_agent(messages, 6)
 
-    messages = run_agent(messages, 6)
+    if status == AgentStatus.COMPLETE:
+        print("Agent 正常完成")
+    elif status == AgentStatus.INCOMPLETE:
+        print("Agent 生成未完成或运行失败")
+    elif status == AgentStatus.MAX_STEPS:
+        print("达到最大模型调用次数，Agent 已停止，任务尚未完成")
 
     for message in messages:
         if message.get("tool_calls"):
