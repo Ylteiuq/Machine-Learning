@@ -34,6 +34,38 @@ def model_response(content=None, calls=None, reason="stop"):
 
 
 class AgentTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        preferences_file = patch.object(
+            agent.memory, "PREFERENCES_FILE", Path(directory.name) / "preferences.json"
+        )
+        preferences_file.start()
+        self.addCleanup(preferences_file.stop)
+
+    def test_context_includes_current_preferences_without_changing_history(self):
+        for turns in [1, 4]:
+            with self.subTest(turns=turns):
+                messages = [{"role": "system", "content": "学习笔记助手"}]
+                for turn in range(turns):
+                    messages.extend([
+                        {"role": "user", "content": f"问题 {turn}"},
+                        {"role": "assistant", "content": f"回答 {turn}"},
+                    ])
+                original = copy.deepcopy(messages)
+                agent.memory.remember_preference("回答长度", "尽量简短")
+                first = agent.context.build_context(messages)
+                second = agent.context.build_context(messages)
+                self.assertEqual(first, second)
+                self.assertEqual(first[0]["content"].count("尽量简短"), 1)
+                self.assertEqual(len(first), 1 + 2 * min(turns, 3))
+
+                agent.memory.remember_preference("回答长度", "详细解释")
+                updated = agent.context.build_context(messages)
+                self.assertIn("详细解释", updated[0]["content"])
+                self.assertNotIn("尽量简短", updated[0]["content"])
+                self.assertEqual(messages, original)
+
     def test_preference_tool_saves_and_updates_without_losing_other_keys(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(
             agent.memory, "PREFERENCES_FILE", Path(directory) / "preferences.json"
