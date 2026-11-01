@@ -1,3 +1,5 @@
+import memory
+
 Notes = [
     {
         "id": "n1",
@@ -70,10 +72,33 @@ TOOL_SCHEMAS = [
                 "additionalProperties": False,
             },
         },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remember_preference",
+            "description": "当用户明确要求记住某项偏好时使用；保存偏好，同名偏好覆盖原值。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key": {
+                        "type": "string",
+                        "description": "偏好名称，例如回答长度",
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": "偏好内容，例如尽量简短",
+                    },
+                },
+                "required": ["key", "value"],
+                "additionalProperties": False,
+            },
+        },
     }
 ]
 
 TOOL_HANDLERS = {
     "search_notes": search_notes,
     "read_notes": read_notes,
+    "remember_preference": memory.remember_preference,
 }

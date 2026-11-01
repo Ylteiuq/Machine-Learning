@@ -34,6 +34,17 @@ def model_response(content=None, calls=None, reason="stop"):
 
 
 class AgentTests(unittest.TestCase):
+    def test_preference_tool_saves_and_updates_without_losing_other_keys(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            agent.memory, "PREFERENCES_FILE", Path(directory) / "preferences.json"
+        ):
+            self.assertEqual(agent.memory.load_preferences(), {})
+            for key, value in [("回答长度", "尽量简短"), ("解释方式", "先举例"), ("回答长度", "详细解释")]:
+                result = agent.execute_tool(tool_call("remember_preference", {"key": key, "value": value}))
+                self.assertEqual(json.loads(result["content"]), {"ok": True, "data": {key: value}})
+                self.assertEqual(agent.memory.load_preferences()[key], value)
+            self.assertEqual(agent.memory.load_preferences(), {"回答长度": "详细解释", "解释方式": "先举例"})
+
     def test_context_keeps_whole_turns_without_changing_history(self):
         messages = [{"role": "system", "content": "学习笔记助手"}]
         for turn in range(1, 4):
