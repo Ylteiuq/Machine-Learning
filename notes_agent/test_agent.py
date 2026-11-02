@@ -34,6 +34,44 @@ def model_response(content=None, calls=None, reason="stop"):
 
 
 class AgentTests(unittest.TestCase):
+    def test_step_pauses_between_tools_without_repeating_or_changing_calls(self):
+        calls = [tool_call("read_notes", {"note_id": "n1"}, "read_1"),
+                 tool_call("read_notes", {"note_id": "n2"}, "read_2")]
+        expected_calls = copy.deepcopy(calls)
+        state = {"messages": [{"role": "user", "content": "读取两篇笔记"}],
+                 "phase": "model", "model_calls": 0, "pending_tools": []}
+        responses = [model_response(calls=calls, reason="tool_calls"), model_response("读取完成")]
+        with patch.object(agent, "request_llm", side_effect=responses) as request, \
+                patch.object(agent, "execute_tool", wraps=agent.execute_tool) as execute, \
+                redirect_stdout(io.StringIO()):
+            agent.step(state)
+            self.assertEqual(state["phase"], "tools")
+            self.assertEqual(state["model_calls"], 1)
+            execute.assert_not_called()
+
+            agent.step(state)
+            self.assertEqual(state["phase"], "tools")
+            self.assertEqual(state["pending_tools"], [expected_calls[1]])
+            self.assertEqual(state["messages"][-1]["tool_call_id"], "read_1")
+            self.assertEqual(state["messages"][1]["tool_calls"], expected_calls)
+
+            agent.step(state)
+            self.assertEqual(state["phase"], "model")
+            self.assertEqual(state["pending_tools"], [])
+            self.assertEqual(state["model_calls"], 1)
+            self.assertEqual(request.call_count, 1)
+            self.assertEqual([call.args[0]["id"] for call in execute.call_args_list], ["read_1", "read_2"])
+            self.assertEqual(state["messages"][1]["tool_calls"], expected_calls)
+
+            agent.step(state)
+            self.assertEqual(state["phase"], "done")
+            self.assertEqual(state["model_calls"], 2)
+            finished = copy.deepcopy(state)
+            agent.step(state)
+            self.assertEqual(state, finished)
+            self.assertEqual(request.call_count, 2)
+            self.assertEqual(execute.call_count, 2)
+
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)

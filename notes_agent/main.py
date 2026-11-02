@@ -117,44 +117,73 @@ class AgentStatus(Enum):
     MAX_STEPS = auto()
     INCOMPLETE = auto()
 
+def step(state: dict) -> None:
+    """原地推进一次模型请求或一个工具调用；终止后不再推进。"""
+    messages = state["messages"]
+    if state["phase"] == "model":
+        state["model_calls"] += 1
+        response = request_llm(context.build_context(messages), tools.TOOL_SCHEMAS)
+        choice = response["choices"][0]
+        message = choice["message"]
+        finish_reason = choice["finish_reason"]
+
+        messages.append(message)
+        print(f"第 {state['model_calls']} 次模型调用：", finish_reason, response.get("usage", {}))
+
+        # 被截断或异常终止的响应不能算完成，也不能执行其中可能残缺的工具请求。
+        if finish_reason not in {"stop", "tool_calls"}:
+            print(f"模型未正常完成生成：{finish_reason}")
+            state["phase"] = "failed"
+            return
+
+        tool_calls = message.get("tool_calls") or []
+        if not tool_calls:
+            if finish_reason == "stop":
+                state["phase"] = "done"
+                return
+            print("模型声明要调用工具，但没有返回工具请求")
+            state["phase"] = "failed"
+            return
+
+        if finish_reason != "tool_calls":
+            print("模型的停止原因与工具请求不一致")
+            state["phase"] = "failed"
+            return
+
+        state["phase"] = "tools"
+        # 队列会被 pop；复制列表，避免同时删除历史中的工具请求。
+        state["pending_tools"] = tool_calls.copy()
+
+    elif state["phase"] == "tools":
+        tool_call = state["pending_tools"][0]
+        print("调用工具：", tool_call["function"]["name"], tool_call["function"]["arguments"])
+        messages.append(execute_tool(tool_call))
+        state["pending_tools"].pop(0)
+        if not state["pending_tools"]:
+            state["phase"] = "model"
+
+
 def run_agent(messages: list[dict], max_steps: int = 6) -> tuple[AgentStatus, list[dict]]:
     """维护传入的消息历史；max_steps 限制模型调用次数，而非工具调用次数。"""
     if type(max_steps) is not int or max_steps < 1:
         raise ValueError("max_steps 必须是正整数")
+    state = {
+        "messages": messages,
+        "phase": "model",
+        "model_calls": 0,
+        "pending_tools": [],
+    }
 
     try:
-        for step in range(1, max_steps + 1):
-            response = request_llm(context.build_context(messages), tools.TOOL_SCHEMAS)
-            choice = response["choices"][0]
-            message = choice["message"]
-            finish_reason = choice["finish_reason"]
+        while state["phase"] not in {"done", "failed"}:
+            # 预算只阻止下一次模型请求；已收到的工具请求仍执行完。
+            if state["phase"] == "model" and state["model_calls"] >= max_steps:
+                return AgentStatus.MAX_STEPS, messages
+            step(state)
 
-            messages.append(message)
-
-            print(f"第 {step} 次模型调用：", finish_reason, response.get("usage", {}))
-
-            # 被截断或异常终止的响应不能算完成，也不能执行其中可能残缺的工具请求。
-            if finish_reason not in {"stop", "tool_calls"}:
-                print(f"模型未正常完成生成：{finish_reason}")
-                return AgentStatus.INCOMPLETE, messages
-
-            tool_calls = message.get("tool_calls") or []
-
-            if not tool_calls:
-                if finish_reason == "stop":
-                    return AgentStatus.COMPLETE, messages
-                print("模型声明要调用工具，但没有返回工具请求")
-                return AgentStatus.INCOMPLETE, messages
-
-            if finish_reason != "tool_calls":
-                print("模型的停止原因与工具请求不一致")
-                return AgentStatus.INCOMPLETE, messages
-
-            for tool_call in tool_calls:
-                print("调用工具：", tool_call["function"]["name"], tool_call["function"]["arguments"])
-                messages.append(execute_tool(tool_call))
-
-        return AgentStatus.MAX_STEPS, messages
+        if state["phase"] == "done":
+            return AgentStatus.COMPLETE, messages
+        return AgentStatus.INCOMPLETE, messages
     except Exception as error:
         # 工具的预期业务错误已转成 tool 消息；其余运行失败在任务边界终止。
         print(f"Agent 运行失败（{type(error).__name__}）：{error}")
