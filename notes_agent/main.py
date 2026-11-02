@@ -160,13 +160,24 @@ def step(state: dict) -> None:
         state["pending_tools"] = tool_calls.copy()
 
     elif state["phase"] == "tools":
-        tool_call = state["pending_tools"][0]
-        print("调用工具：", tool_call["function"]["name"], tool_call["function"]["arguments"])
-        messages.append(execute_tool(tool_call, state["run_id"]))
-        state["pending_tools"].pop(0)
+        if state["pending_tools"][0] in tools.TOOL_PARALLEL:
+            while state["pending_tools"][0] in tools.TOOL_PARALLEL:
+                tool_call = state["pending_tools"][0]
+                print("调用工具：", tool_call["function"]["name"], tool_call["function"]["arguments"])
+                messages.append(execute_tool(tool_call, state["run_id"]))
+                state["pending_tools"].pop(0)
 
-        if not state["pending_tools"]:
-            state["phase"] = "model"
+                if not state["pending_tools"]:
+                    state["phase"] = "model"
+                    break
+        else:
+            tool_call = state["pending_tools"][0]
+            print("调用工具：", tool_call["function"]["name"], tool_call["function"]["arguments"])
+            messages.append(execute_tool(tool_call, state["run_id"]))
+            state["pending_tools"].pop(0)
+
+            if not state["pending_tools"]:
+                state["phase"] = "model"
 
 
 def run_agent(messages: list[dict], max_steps: int = 6, resume: bool = False) -> tuple[AgentStatus, list[dict]]:
