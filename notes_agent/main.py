@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 import tools
 import memory
 import context
+import checkpoint
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
@@ -163,16 +164,22 @@ def step(state: dict) -> None:
             state["phase"] = "model"
 
 
-def run_agent(messages: list[dict], max_steps: int = 6) -> tuple[AgentStatus, list[dict]]:
+def run_agent(messages: list[dict], max_steps: int = 6, resume: bool = False) -> tuple[AgentStatus, list[dict]]:
     """维护传入的消息历史；max_steps 限制模型调用次数，而非工具调用次数。"""
     if type(max_steps) is not int or max_steps < 1:
         raise ValueError("max_steps 必须是正整数")
-    state = {
-        "messages": messages,
-        "phase": "model",
-        "model_calls": 0,
-        "pending_tools": [],
-    }
+
+    if resume:
+        state = checkpoint.load_checkpoint()
+        messages = state["messages"]
+    else:
+        state = {
+            "messages": messages,
+            "phase": "model",
+            "model_calls": 0,
+            "pending_tools": [],
+        }
+        checkpoint.save_checkpoint(state)
 
     try:
         while state["phase"] not in {"done", "failed"}:
@@ -180,6 +187,7 @@ def run_agent(messages: list[dict], max_steps: int = 6) -> tuple[AgentStatus, li
             if state["phase"] == "model" and state["model_calls"] >= max_steps:
                 return AgentStatus.MAX_STEPS, messages
             step(state)
+            checkpoint.save_checkpoint(state)
 
         if state["phase"] == "done":
             return AgentStatus.COMPLETE, messages
@@ -209,13 +217,16 @@ def main() -> None:
             continue
         if question == "exit":
             break
-        message = {
-            "role": "user",
-            "content": question
-        }
-        messages.append(message)
+        if question == "/resume":
+            status, messages = run_agent(messages, 10, resume=True)
+        else:
+            message = {
+                "role": "user",
+                "content": question
+            }
+            messages.append(message)
 
-        status, messages = run_agent(messages, 6)
+            status, messages = run_agent(messages, 6)
 
         if status == AgentStatus.COMPLETE:
             print(messages[-1]["role"], messages[-1]["content"])
