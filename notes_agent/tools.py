@@ -30,19 +30,27 @@ def read_notes(note_id: str) -> dict:
 
     raise ValueError(f"未查询到对应的id: {note_id}")
 
-def save_notes(title: str, content: str) -> dict:
+def save_notes(title: str, content: str, *, execution_id: str) -> dict:
     Notes = load_notes()
+
+    for note in Notes:
+        if note.get("execution_id") == execution_id:
+            return note
 
     num_id = 'n' + str(max((int(note["id"][1:]) for note in Notes), default=0) + 1)
 
     Notes.append({
         "id": num_id,
         "title": title,
-        "content": content
+        "content": content,
+        "execution_id": execution_id,
     })
 
-    with open(NOTES_FILE, "w", encoding="utf-8") as file:
+    # 笔记和执行标识一起提交，恢复后才能识别已经完成的写入。
+    temporary_file = NOTES_FILE.with_suffix(".tmp")
+    with open(temporary_file, "w", encoding="utf-8") as file:
         json.dump(Notes, file, ensure_ascii=False, indent=2)
+    temporary_file.replace(NOTES_FILE)
 
     return Notes[-1]
 

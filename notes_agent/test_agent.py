@@ -34,11 +34,74 @@ def model_response(content=None, calls=None, reason="stop"):
 
 
 class AgentTests(unittest.TestCase):
+    def test_save_notes_deduplicates_by_execution_not_content(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            tools, "NOTES_FILE", Path(directory) / "notes.json"
+        ):
+            tools.NOTES_FILE.write_text("[]", encoding="utf-8")
+            call = tool_call("save_notes", {"title": "测试", "content": "正文"}, "save_1")
+            first = agent.execute_tool(call, "run-a")
+            self.assertTrue(json.loads(first["content"])["ok"])
+            self.assertEqual(agent.execute_tool(call, "run-a"), first)
+            self.assertEqual(len(tools.load_notes()), 1)
+            agent.execute_tool(call, "run-b")
+            agent.execute_tool(tool_call("save_notes", {"title": "测试", "content": "正文"}, "save_2"), "run-a")
+            self.assertEqual([note["id"] for note in tools.load_notes()], ["n1", "n2", "n3"])
+            forged = tool_call("save_notes", {"title": "测试", "content": "正文", "execution_id": "forged"})
+            self.assertFalse(json.loads(agent.execute_tool(forged, "run-a")["content"])["ok"])
+            self.assertEqual(len(tools.load_notes()), 3)
+
+    def test_resume_after_note_written_but_checkpoint_not_saved(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            tools, "NOTES_FILE", Path(directory) / "notes.json"
+        ), redirect_stdout(io.StringIO()):
+            tools.NOTES_FILE.write_text("[]", encoding="utf-8")
+            call = tool_call("save_notes", {"title": "测试", "content": "正文"}, "save_1")
+            state = {"run_id": "run-a", "phase": "tools", "model_calls": 1,
+                     "pending_tools": [call], "messages": [
+                         {"role": "user", "content": "保存笔记"},
+                         {"role": "assistant", "content": None, "tool_calls": [call]},
+                     ]}
+            agent.checkpoint.save_checkpoint(state)
+            with patch.object(agent.checkpoint, "save_checkpoint", side_effect=OSError("模拟保存中断")), \
+                    patch.object(agent, "request_llm") as request:
+                status, _ = agent.run_agent([], resume=True)
+                self.assertEqual(status, agent.AgentStatus.INCOMPLETE)
+                request.assert_not_called()
+            self.assertEqual(len(tools.load_notes()), 1)
+            saved_note = tools.load_notes()[0]
+            self.assertEqual(agent.checkpoint.load_checkpoint(), state)
+
+            with patch.object(agent, "request_llm", return_value=model_response("保存完成")):
+                status, history = agent.run_agent([], resume=True)
+            self.assertEqual(status, agent.AgentStatus.COMPLETE)
+            self.assertEqual(tools.load_notes(), [saved_note])
+            self.assertEqual(json.loads(history[-2]["content"])["data"], saved_note)
+            saved_state = agent.checkpoint.load_checkpoint()
+            self.assertEqual(saved_state["run_id"], "run-a")
+            self.assertEqual(saved_state["phase"], "done")
+            self.assertEqual(saved_state["model_calls"], 2)
+
+    def test_failed_replacement_preserves_notes_and_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            tools, "NOTES_FILE", Path(directory) / "notes.json"
+        ):
+            tools.NOTES_FILE.write_text("[]", encoding="utf-8")
+            original = {"run_id": "run-a", "phase": "model"}
+            agent.checkpoint.save_checkpoint(original)
+            with patch.object(Path, "replace", side_effect=OSError("模拟替换失败")):
+                with self.assertRaises(OSError):
+                    tools.save_notes("测试", "正文", execution_id="run-a:save_1")
+                with self.assertRaises(OSError):
+                    agent.checkpoint.save_checkpoint({"phase": "done"})
+            self.assertEqual(tools.load_notes(), [])
+            self.assertEqual(agent.checkpoint.load_checkpoint(), original)
+
     def test_step_pauses_between_tools_without_repeating_or_changing_calls(self):
         calls = [tool_call("read_notes", {"note_id": "n1"}, "read_1"),
                  tool_call("read_notes", {"note_id": "n2"}, "read_2")]
         expected_calls = copy.deepcopy(calls)
-        state = {"messages": [{"role": "user", "content": "读取两篇笔记"}],
+        state = {"run_id": "test-run", "messages": [{"role": "user", "content": "读取两篇笔记"}],
                  "phase": "model", "model_calls": 0, "pending_tools": []}
         responses = [model_response(calls=calls, reason="tool_calls"), model_response("读取完成")]
         with patch.object(agent, "request_llm", side_effect=responses) as request, \
@@ -80,6 +143,9 @@ class AgentTests(unittest.TestCase):
         )
         preferences_file.start()
         self.addCleanup(preferences_file.stop)
+        checkpoint_file = patch.object(agent.checkpoint, "CHECKPOINT", Path(directory.name) / "checkpoint.json")
+        checkpoint_file.start()
+        self.addCleanup(checkpoint_file.stop)
 
     def test_context_includes_current_preferences_without_changing_history(self):
         for turns in [1, 4]:
@@ -110,7 +176,7 @@ class AgentTests(unittest.TestCase):
         ):
             self.assertEqual(agent.memory.load_preferences(), {})
             for key, value in [("回答长度", "尽量简短"), ("解释方式", "先举例"), ("回答长度", "详细解释")]:
-                result = agent.execute_tool(tool_call("remember_preference", {"key": key, "value": value}))
+                result = agent.execute_tool(tool_call("remember_preference", {"key": key, "value": value}), "test-run")
                 self.assertEqual(json.loads(result["content"]), {"ok": True, "data": {key: value}})
                 self.assertEqual(agent.memory.load_preferences()[key], value)
             self.assertEqual(agent.memory.load_preferences(), {"回答长度": "详细解释", "解释方式": "先举例"})
@@ -131,7 +197,7 @@ class AgentTests(unittest.TestCase):
         messages.extend([
             {"role": "user", "content": "读取 Attention 笔记"},
             {"role": "assistant", "content": None, "tool_calls": [call]},
-            agent.execute_tool(call),
+            agent.execute_tool(call, "test-run"),
         ])
         original = copy.deepcopy(messages)
         context = agent.context.build_context(messages)
@@ -166,7 +232,7 @@ class AgentTests(unittest.TestCase):
                 handler = tools.TOOL_HANDLERS[function["name"]]
                 self.assertEqual(
                     set(parameters["properties"]),
-                    set(inspect.signature(handler).parameters),
+                    set(inspect.signature(handler).parameters) - ({"execution_id"} if function["name"] == "save_notes" else set()),
                 )
                 self.assertLessEqual(set(parameters["required"]), set(parameters["properties"]))
 
@@ -186,7 +252,7 @@ class AgentTests(unittest.TestCase):
                               {field: ""}, {field: "  "}, {field: "n1", "extra": 1}]:
                 with self.subTest(tool=name, arguments=arguments):
                     with patch.dict(tools.TOOL_HANDLERS, {name: unittest.mock.Mock()}) as handlers:
-                        result = agent.execute_tool(tool_call(name, arguments))
+                        result = agent.execute_tool(tool_call(name, arguments), "test-run")
                         handlers[name].assert_not_called()
                     self.assertEqual(result["role"], "tool")
                     self.assertEqual(result["tool_call_id"], "call_test")
@@ -202,7 +268,7 @@ class AgentTests(unittest.TestCase):
         for call in [tool_call("unknown", {}), invalid_json, non_string,
                      tool_call("read_notes", {"note_id": "missing"})]:
             with self.subTest(call=call):
-                result = agent.execute_tool(call)
+                result = agent.execute_tool(call, "test-run")
                 self.assertEqual(result["tool_call_id"], call["id"])
                 self.assertFalse(json.loads(result["content"])["ok"])
 

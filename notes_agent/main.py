@@ -3,6 +3,7 @@ import json
 import urllib.request
 from enum import Enum, auto
 from pathlib import Path
+import uuid
 
 from dotenv import load_dotenv
 
@@ -60,7 +61,7 @@ def find_tool_schemas(tool_name: str, tool_schemas: list[dict]) -> dict:
 
     raise ValueError(f"找不到对应tool: {tool_name}")
 
-def execute_tool(tool_call: dict) -> dict:
+def execute_tool(tool_call: dict, run_id: str) -> dict:
     """执行一次工具请求，返回可追加到 messages 的工具消息。"""
 
     tool_id = tool_call["id"]
@@ -97,6 +98,9 @@ def execute_tool(tool_call: dict) -> dict:
 
         # 实际调用也放在 try 中，read_notes 抛出的业务错误才能回传给模型。
         func = tools.TOOL_HANDLERS[tool_name]
+        if tool_name == "save_notes":
+            # 内部执行标识由运行时注入，不由模型提供。
+            arguments["execution_id"] = f"{run_id}:{tool_id}"
         result = {
             "ok": True,
             "data": func(**arguments),
@@ -158,8 +162,9 @@ def step(state: dict) -> None:
     elif state["phase"] == "tools":
         tool_call = state["pending_tools"][0]
         print("调用工具：", tool_call["function"]["name"], tool_call["function"]["arguments"])
-        messages.append(execute_tool(tool_call))
+        messages.append(execute_tool(tool_call, state["run_id"]))
         state["pending_tools"].pop(0)
+
         if not state["pending_tools"]:
             state["phase"] = "model"
 
@@ -174,6 +179,7 @@ def run_agent(messages: list[dict], max_steps: int = 6, resume: bool = False) ->
         messages = state["messages"]
     else:
         state = {
+            "run_id": uuid.uuid4().hex,
             "messages": messages,
             "phase": "model",
             "model_calls": 0,
