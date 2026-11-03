@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 NOTES_FILE = Path(__file__).resolve().parent / "notes.json"
+TOOL_PARALLEL = {"search_notes", "read_notes"}
 
 def load_notes() -> list[dict]:
     with open(NOTES_FILE, "r", encoding="utf-8") as file:

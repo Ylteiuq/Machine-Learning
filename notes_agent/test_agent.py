@@ -6,6 +6,7 @@ import io
 import json
 import os
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -34,6 +35,76 @@ def model_response(content=None, calls=None, reason="stop"):
 
 
 class AgentTests(unittest.TestCase):
+    def test_parallel_reads_keep_result_order_and_do_not_cross_writes(self):
+        calls = [tool_call("read_notes", {"note_id": "n1"}, "read_1"),
+                 tool_call("read_notes", {"note_id": "n2"}, "read_2"),
+                 tool_call("save_notes", {"title": "测试", "content": "正文"}, "write_1"),
+                 tool_call("search_notes", {"query": "测试"}, "read_3"),
+                 tool_call("remember_preference", {"key": "长度", "value": "简短"}, "write_2")]
+        state = {"run_id": "run-a", "phase": "tools", "model_calls": 1,
+                 "pending_tools": calls.copy(), "messages": [
+                     {"role": "assistant", "content": None, "tool_calls": copy.deepcopy(calls)}
+                 ]}
+        original = copy.deepcopy(state)
+        barrier = threading.Barrier(2)
+        second_finished = threading.Event()
+        finished = []
+        main_thread = threading.get_ident()
+
+        def execute(call, run_id):
+            self.assertEqual(run_id, "run-a")
+            call_id = call["id"]
+            if call_id in {"read_1", "read_2"}:
+                self.assertNotEqual(threading.get_ident(), main_thread)
+                barrier.wait(timeout=3)  # 串行执行无法通过此处。
+                if call_id == "read_1":
+                    self.assertTrue(second_finished.wait(timeout=3))
+                self.assertEqual(state, original)  # 工作线程执行期间没有提交半批结果。
+                finished.append(call_id)
+                if call_id == "read_2":
+                    second_finished.set()
+            else:
+                expected = {"write_1": ["read_2", "read_1"],
+                            "read_3": ["read_2", "read_1", "write_1"],
+                            "write_2": ["read_2", "read_1", "write_1", "read_3"]}
+                self.assertEqual(finished, expected[call_id])
+                self.assertEqual(threading.get_ident(), main_thread)
+                finished.append(call_id)
+            return {"role": "tool", "tool_call_id": call_id, "content": "结果"}
+
+        with patch.object(agent, "execute_tool", side_effect=execute), redirect_stdout(io.StringIO()):
+            for remaining in [3, 2, 1, 0]:
+                agent.step(state)
+                self.assertEqual(len(state["pending_tools"]), remaining)
+        self.assertEqual(state["phase"], "model")
+        self.assertEqual(state["model_calls"], 1)
+        self.assertEqual([m["tool_call_id"] for m in state["messages"][1:]], [c["id"] for c in calls])
+        self.assertEqual(state["messages"][0], original["messages"][0])
+
+    def test_failed_read_batch_does_not_commit_partial_state(self):
+        calls = [tool_call("read_notes", {"note_id": "n1"}, "read_1"),
+                 tool_call("read_notes", {"note_id": "n2"}, "read_2")]
+        state = {"run_id": "run-a", "phase": "tools", "model_calls": 1,
+                 "pending_tools": calls.copy(), "messages": [
+                     {"role": "assistant", "content": None, "tool_calls": copy.deepcopy(calls)}
+                 ]}
+        original = copy.deepcopy(state)
+        barrier = threading.Barrier(2)
+        finished = threading.Event()
+
+        def execute(call, run_id):
+            barrier.wait(timeout=3)
+            if call["id"] == "read_1":
+                raise OSError("模拟读取失败")
+            finished.set()
+            return {"role": "tool", "tool_call_id": call["id"], "content": "结果"}
+
+        with patch.object(agent, "execute_tool", side_effect=execute), redirect_stdout(io.StringIO()):
+            with self.assertRaises(OSError):
+                agent.step(state)
+        self.assertTrue(finished.is_set())
+        self.assertEqual(state, original)
+
     def test_save_notes_deduplicates_by_execution_not_content(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(
             tools, "NOTES_FILE", Path(directory) / "notes.json"
@@ -97,7 +168,7 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(tools.load_notes(), [])
             self.assertEqual(agent.checkpoint.load_checkpoint(), original)
 
-    def test_step_pauses_between_tools_without_repeating_or_changing_calls(self):
+    def test_step_runs_read_batch_without_repeating_or_changing_calls(self):
         calls = [tool_call("read_notes", {"note_id": "n1"}, "read_1"),
                  tool_call("read_notes", {"note_id": "n2"}, "read_2")]
         expected_calls = copy.deepcopy(calls)
@@ -113,17 +184,12 @@ class AgentTests(unittest.TestCase):
             execute.assert_not_called()
 
             agent.step(state)
-            self.assertEqual(state["phase"], "tools")
-            self.assertEqual(state["pending_tools"], [expected_calls[1]])
-            self.assertEqual(state["messages"][-1]["tool_call_id"], "read_1")
-            self.assertEqual(state["messages"][1]["tool_calls"], expected_calls)
-
-            agent.step(state)
             self.assertEqual(state["phase"], "model")
             self.assertEqual(state["pending_tools"], [])
             self.assertEqual(state["model_calls"], 1)
             self.assertEqual(request.call_count, 1)
-            self.assertEqual([call.args[0]["id"] for call in execute.call_args_list], ["read_1", "read_2"])
+            self.assertCountEqual([call.args[0]["id"] for call in execute.call_args_list], ["read_1", "read_2"])
+            self.assertEqual([message["tool_call_id"] for message in state["messages"][-2:]], ["read_1", "read_2"])
             self.assertEqual(state["messages"][1]["tool_calls"], expected_calls)
 
             agent.step(state)

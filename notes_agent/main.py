@@ -4,6 +4,7 @@ import urllib.request
 from enum import Enum, auto
 from pathlib import Path
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 from dotenv import load_dotenv
 
@@ -117,13 +118,24 @@ def execute_tool(tool_call: dict, run_id: str) -> dict:
         "content": json.dumps(result, ensure_ascii=False),
     }
 
+def execute_tool_batch(tool_calls: list[dict], run_id: str) -> list[dict]:
+    """执行调度好的批次：单个工具直接执行，多个读取工具最多两路并行。"""
+    if len(tool_calls) == 1:
+        return [execute_tool(tool_calls[0], run_id)]
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(execute_tool, call, run_id) for call in tool_calls]
+        # 先全部提交，再按请求顺序收集；结果顺序不受完成先后影响。
+        return [future.result() for future in futures]
+
+
 class AgentStatus(Enum):
     COMPLETE = auto()
     MAX_STEPS = auto()
     INCOMPLETE = auto()
 
 def step(state: dict) -> None:
-    """原地推进一次模型请求或一个工具调用；终止后不再推进。"""
+    """原地推进一次模型请求或一个工具批次；终止后不再推进。"""
     messages = state["messages"]
     if state["phase"] == "model":
         state["model_calls"] += 1
@@ -160,24 +172,23 @@ def step(state: dict) -> None:
         state["pending_tools"] = tool_calls.copy()
 
     elif state["phase"] == "tools":
-        if state["pending_tools"][0] in tools.TOOL_PARALLEL:
-            while state["pending_tools"][0] in tools.TOOL_PARALLEL:
-                tool_call = state["pending_tools"][0]
-                print("调用工具：", tool_call["function"]["name"], tool_call["function"]["arguments"])
-                messages.append(execute_tool(tool_call, state["run_id"]))
-                state["pending_tools"].pop(0)
+        batch = []
+        for tool_call in state["pending_tools"]:
+            if tool_call["function"]["name"] not in tools.TOOL_PARALLEL:
+                break
+            batch.append(tool_call)
+        if not batch:
+            batch = state["pending_tools"][:1]
 
-                if not state["pending_tools"]:
-                    state["phase"] = "model"
-                    break
-        else:
-            tool_call = state["pending_tools"][0]
+        for tool_call in batch:
             print("调用工具：", tool_call["function"]["name"], tool_call["function"]["arguments"])
-            messages.append(execute_tool(tool_call, state["run_id"]))
-            state["pending_tools"].pop(0)
+        results = execute_tool_batch(batch, state["run_id"])
+        # 工作线程不修改状态；整批结果返回后由主线程统一提交。
+        messages.extend(results)
+        del state["pending_tools"][:len(batch)]
 
-            if not state["pending_tools"]:
-                state["phase"] = "model"
+        if not state["pending_tools"]:
+            state["phase"] = "model"
 
 
 def run_agent(messages: list[dict], max_steps: int = 6, resume: bool = False) -> tuple[AgentStatus, list[dict]]:
