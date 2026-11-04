@@ -15,6 +15,12 @@ import checkpoint
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
+SYSTEM_PROMPT = (
+    "你是学习笔记助手，使用简洁的中文回答。先搜索本地笔记获取编号；"
+    "回答笔记的具体内容前，使用 read_notes 读取正文。"
+    "依据工具结果回答并标注笔记编号；没有找到时明确说明。"
+)
+
 def request_llm(messages: list[dict], tools=None) -> dict:
     api_key = os.getenv("LLM_API_KEY")
 
@@ -231,11 +237,7 @@ def main() -> None:
         messages = [
             {
                 "role": "system",
-                "content": (
-                    "你是学习笔记助手，使用简洁的中文回答。先搜索本地笔记获取编号；"
-                    "回答笔记的具体内容前，使用 read_notes 读取正文。"
-                    "依据工具结果回答并标注笔记编号；没有找到时明确说明。"
-                )
+                "content": SYSTEM_PROMPT,
             }
         ]
 
