@@ -1,6 +1,4 @@
-import os
 import json
-import urllib.request
 from enum import Enum, auto
 from pathlib import Path
 import uuid
@@ -12,6 +10,7 @@ import tools
 import memory
 import context
 import checkpoint
+import request
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
@@ -20,45 +19,6 @@ SYSTEM_PROMPT = (
     "回答笔记的具体内容前，使用 read_notes 读取正文。"
     "依据工具结果回答并标注笔记编号；没有找到时明确说明。"
 )
-
-def request_llm(messages: list[dict], tools=None) -> dict:
-    api_key = os.getenv("LLM_API_KEY")
-
-    if not api_key:
-        raise RuntimeError("缺少 LLM_API_KEY,请在终端设置api_key")
-
-    api_url = os.environ["LLM_API_URL"]
-    model = os.environ["LLM_MODEL"]
-
-    payload = {
-        "model": model,
-        "messages": messages,
-        "stream": False,
-        "thinking": {"type": "disabled"},
-        "max_tokens": 2048,
-    }
-
-    # 先补齐请求体，再编码；编码后的 body 不会随 payload 的修改而变化。
-    if tools:
-        payload["tools"] = tools
-        payload["tool_choice"] = "auto"
-
-    body = json.dumps(payload).encode("utf-8")
-
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}",
-    }
-
-    request = urllib.request.Request(
-        api_url,
-        data=body,
-        headers=headers,
-        method="POST",
-    )
-
-    with urllib.request.urlopen(request, timeout=60) as response:
-        return json.load(response)
 
 def find_tool_schemas(tool_name: str, tool_schemas: list[dict]) -> dict:
     """返回工具原始的参数描述，保持与发送给模型的字段名一致。"""
@@ -145,7 +105,9 @@ def step(state: dict) -> None:
     messages = state["messages"]
     if state["phase"] == "model":
         state["model_calls"] += 1
-        response = request_llm(context.build_context(messages), tools.TOOL_SCHEMAS)
+        response = request.request_llm(context.build_context(
+            messages, state.get("summary", ""), state.get("summarized_until", 0)
+        ), tools.TOOL_SCHEMAS)
         choice = response["choices"][0]
         message = choice["message"]
         finish_reason = choice["finish_reason"]
@@ -197,7 +159,8 @@ def step(state: dict) -> None:
             state["phase"] = "model"
 
 
-def run_agent(messages: list[dict], max_steps: int = 6, resume: bool = False) -> tuple[AgentStatus, list[dict]]:
+def run_agent(messages: list[dict], max_steps: int = 6, resume: bool = False,
+              session: dict = None) -> tuple[AgentStatus, list[dict]]:
     """维护传入的消息历史；max_steps 限制模型调用次数，而非工具调用次数。"""
     if type(max_steps) is not int or max_steps < 1:
         raise ValueError("max_steps 必须是正整数")
@@ -205,6 +168,9 @@ def run_agent(messages: list[dict], max_steps: int = 6, resume: bool = False) ->
     if resume:
         state = checkpoint.load_checkpoint()
         messages = state["messages"]
+        if session is not None:
+            session.update(messages=messages, summary=state.get("summary", ""),
+                           summarized_until=state.get("summarized_until", 0))
     else:
         state = {
             "run_id": uuid.uuid4().hex,
@@ -212,6 +178,8 @@ def run_agent(messages: list[dict], max_steps: int = 6, resume: bool = False) ->
             "phase": "model",
             "model_calls": 0,
             "pending_tools": [],
+            "summary": session["summary"] if session is not None else "",
+            "summarized_until": session["summarized_until"] if session is not None else 0,
         }
         checkpoint.save_checkpoint(state)
 
@@ -232,7 +200,8 @@ def run_agent(messages: list[dict], max_steps: int = 6, resume: bool = False) ->
         return AgentStatus.INCOMPLETE, messages
 
 def main() -> None:
-    messages = memory.load_messages()
+    session = memory.load_messages()
+    messages = session["messages"]
     if not messages:
         messages = [
             {
@@ -240,6 +209,7 @@ def main() -> None:
                 "content": SYSTEM_PROMPT,
             }
         ]
+        session["messages"] = messages
 
     while True:
         question = input("请输入问题（输入 exit 退出）：").strip()
@@ -248,7 +218,7 @@ def main() -> None:
         if question == "exit":
             break
         if question == "/resume":
-            status, messages = run_agent(messages, 10, resume=True)
+            status, messages = run_agent(messages, 10, resume=True, session=session)
         else:
             message = {
                 "role": "user",
@@ -256,11 +226,11 @@ def main() -> None:
             }
             messages.append(message)
 
-            status, messages = run_agent(messages, 6)
+            status, messages = run_agent(messages, 6, session=session)
 
         if status == AgentStatus.COMPLETE:
             print(messages[-1]["role"], messages[-1]["content"])
-            memory.save_messages(messages)
+            memory.save_messages(messages, session["summary"], session["summarized_until"])
         elif status == AgentStatus.INCOMPLETE:
             print("Agent 生成未完成或运行失败")
             break
