@@ -169,6 +169,10 @@ def run_agent(messages: list[dict], max_steps: int = 6, resume: bool = False,
         state = checkpoint.load_checkpoint()
         messages = state["messages"]
         if session is not None:
+            # 同一份历史可能在检查点保存后被 /compact 压缩过。
+            if (session["summarized_until"] > state.get("summarized_until", 0)
+                    and session["messages"] == messages):
+                state.update(summary=session["summary"], summarized_until=session["summarized_until"])
             session.update(messages=messages, summary=state.get("summary", ""),
                            summarized_until=state.get("summarized_until", 0))
     else:
@@ -199,6 +203,20 @@ def run_agent(messages: list[dict], max_steps: int = 6, resume: bool = False,
         print(f"Agent 运行失败（{type(error).__name__}）：{error}")
         return AgentStatus.INCOMPLETE, messages
 
+def run_compact(session: dict) -> None:
+    try:
+        compact = context.compact_context(**session)
+        if not compact:
+            print("没有需要压缩的新历史。")
+            return
+        memory.save_messages(session["messages"], **compact)
+    except Exception as error:
+        print(f"压缩失败（{type(error).__name__}）：{error}")
+        return
+
+    session.update(compact)
+    print("摘要已保存，最近三轮对话已完整保留。")
+
 def main() -> None:
     session = memory.load_messages()
     messages = session["messages"]
@@ -217,6 +235,10 @@ def main() -> None:
             continue
         if question == "exit":
             break
+        if question == "/compact":
+            run_compact(session)
+            continue
+
         if question == "/resume":
             status, messages = run_agent(messages, 10, resume=True, session=session)
         else:
