@@ -18,6 +18,9 @@ def save_notes(title: str, content: str, *, execution_id: str) -> dict:
 def update_notes(note_id: str, title: str, content: str) -> dict:
     return notes_sqlite.update_note(note_id, title, content)
 
+def delete_notes(note_id: str) -> bool:
+    return notes_sqlite.delete_note(note_id)
+
 TOOL_SCHEMAS = [
     {
         "type": "function",
@@ -108,7 +111,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "update_notes",
-            "description": "更新笔记标题或内容",
+            "description": "按编号替换已有笔记的完整标题和正文。用户要求修改时使用；需要保留原有内容时先读取笔记，再提交完整的新内容。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -129,6 +132,24 @@ TOOL_SCHEMAS = [
                 "additionalProperties": False,
             },
         },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_notes",
+            "description": "用户明确要求删除时，按编号永久删除一篇笔记；成功返回 true，编号不存在时返回错误。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "note_id": {
+                        "type": "string",
+                        "description": "笔记的id"
+                    }
+                },
+                "required": ["note_id"],
+                "additionalProperties": False,
+            },
+        },
     }
 ]
 
@@ -138,4 +159,5 @@ TOOL_HANDLERS = {
     "remember_preference": memory.remember_preference,
     "save_notes": save_notes,
     "update_notes": update_notes,
+    "delete_notes": delete_notes,
 }

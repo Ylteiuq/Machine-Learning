@@ -119,26 +119,37 @@ def get_note_by_id(note_id: str) -> dict:
         return _note_dict(row)
 
 
-def update_note(note_id: str, title: str, content: str, execetion_id: str) -> dict:
-    with closing(sqlite3.connect(file_name)) as conn:
-        with conn:
-            conn.row_factory = sqlite3.Row
-            conn.execute("BEGIN IMMEDIATE")
-            cursor = conn.execute("""
-                UPDATE notes
-                SET title = ?, content = ?
-                WHERE id = ?
-            """, (title, content, int(note_id[1:])))
-            if cursor.rowcount == 0:
-                raise "没有笔记被更改"
-            row = conn.execute(
-                "SELECT * FROM notes WHERE id = ?", (note_id,)
-            ).fetchone()
-            return _note_dict(row)
+def update_note(note_id: str, title: str, content: str) -> dict:
+    if not note_id.startswith("n") or not note_id[1:].isdigit():
+        raise ValueError(f"无效的笔记编号: {note_id}")
+    with closing(sqlite3.connect(file_name)) as conn, conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute("""
+            UPDATE notes
+            SET title = ?, content = ?
+            WHERE id = ?
+        """, (title, content, int(note_id[1:])))
+        if cursor.rowcount == 0:
+            raise ValueError(f"未查询到对应的id: {note_id}")
+        row = conn.execute(
+            "SELECT * FROM notes WHERE id = ?", (int(note_id[1:]),)
+        ).fetchone()
+        return _note_dict(row)
 
 
-def delete_note():
-    ...
+def delete_note(note_id: str) -> bool:
+    if not note_id.startswith("n") or not note_id[1:].isdigit():
+        raise ValueError(f"无效的笔记编号: {note_id}")
+    with closing(sqlite3.connect(file_name)) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute("""
+            DELETE FROM notes
+            WHERE id = ?
+        """, (int(note_id[1:]),))
+        if cursor.rowcount == 0:
+            raise ValueError(f"未查询到对应的id: {note_id}")
+        return True
 
 
 def list_notes() -> list[dict]:
