@@ -105,13 +105,14 @@ def run_case(case: dict) -> dict:
     with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
         root = Path(directory)
         for module, attribute, filename in [
-            (tools, "NOTES_FILE", "notes.json"),
+            (tools.notes_sqlite, "file_name", "notes.db"),
+            (tools.notes_sqlite, "JSON_FILE", "notes.json"),
             (agent.memory, "PREFERENCES_FILE", "preferences.json"),
             (agent.memory, "SESSION_FILE", "session.json"),
             (agent.checkpoint, "CHECKPOINT", "checkpoint.json"),
         ]:
             stack.enter_context(patch.object(module, attribute, root / filename))
-        tools.NOTES_FILE.write_text(json.dumps(INITIAL_NOTES, ensure_ascii=False), encoding="utf-8")
+        tools.notes_sqlite.JSON_FILE.write_text(json.dumps(INITIAL_NOTES, ensure_ascii=False), encoding="utf-8")
         with redirect_stdout(output):
             status, messages = agent.run_agent(messages, max_steps=6)
         notes_after = tools.load_notes()

@@ -165,6 +165,8 @@ def run_agent(messages: list[dict], max_steps: int = 6, resume: bool = False,
     if type(max_steps) is not int or max_steps < 1:
         raise ValueError("max_steps 必须是正整数")
 
+    tools.notes_sqlite.make_sqlite()
+
     if resume:
         state = checkpoint.load_checkpoint()
         messages = state["messages"]
