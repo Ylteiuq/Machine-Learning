@@ -19,6 +19,51 @@ def make_sqlite() -> bool:
                 execution_id TEXT UNIQUE
             )
         """)
+        conn.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts
+            USING fts5(
+                title,
+                content,
+                content='notes',
+                content_rowid='id',
+                tokenize='trigram'
+            )
+        """)
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS notes_ai
+            AFTER INSERT ON notes
+            BEGIN
+                INSERT INTO notes_fts(rowid, title, content)
+                VALUES (new.id, new.title, new.content);
+            END;
+        """)
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS notes_ad
+            AFTER DELETE ON notes
+            BEGIN
+                INSERT INTO notes_fts(
+                    notes_fts, rowid, title, content
+                )
+                VALUES (
+                    'delete', old.id, old.title, old.content
+                );
+            END;
+        """)
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS notes_au
+            AFTER UPDATE ON notes
+            BEGIN
+                INSERT INTO notes_fts(
+                    notes_fts, rowid, title, content
+                )
+                VALUES (
+                    'delete', old.id, old.title, old.content
+                );
+
+                INSERT INTO notes_fts(rowid, title, content)
+                VALUES (new.id, new.title, new.content);
+            END;
+        """)
         if conn.execute("PRAGMA user_version").fetchone()[0] == 0:
             if JSON_FILE.exists():
                 notes = json.loads(JSON_FILE.read_text(encoding="utf-8"))
@@ -29,6 +74,13 @@ def make_sqlite() -> bool:
                         ON CONFLICT(id) DO NOTHING
                     """, (int(note["id"][1:]), note["title"], note["content"], note.get("execution_id")))
             conn.execute("PRAGMA user_version = 1")
+
+        if conn.execute("PRAGMA user_version").fetchone()[0] < 2:
+            conn.execute("""
+                INSERT INTO notes_fts(notes_fts)
+                VALUES('rebuild')
+            """)
+            conn.execute("PRAGMA user_version = 2")
     return True
 
 
@@ -80,3 +132,31 @@ def list_notes() -> list[dict]:
         conn.row_factory = sqlite3.Row
         rows = conn.execute("SELECT * FROM notes ORDER BY id").fetchall()
         return [_note_dict(row) for row in rows]
+
+def search_notes(query: str, top_k: int = 5) -> list[dict]:
+
+    with closing(sqlite3.connect(file_name)) as conn:
+        conn.row_factory = sqlite3.Row
+
+        match_query = '"' + query.replace('"', '""') + '"'
+
+        rows = conn.execute("""
+            SELECT
+                notes.id,
+                notes.title,
+                bm25(notes_fts) AS score
+            FROM notes_fts
+            JOIN notes ON notes.id = notes_fts.rowid
+            WHERE notes_fts MATCH ?
+            ORDER BY score
+            LIMIT ?
+        """, (match_query, top_k)).fetchall()
+
+        return [
+            {
+                "id": row["id"],
+                "title": row["title"],
+                "score": row["score"]
+            }
+            for row in rows
+        ]
