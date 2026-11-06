@@ -7,7 +7,7 @@ def load_notes() -> list[dict]:
     return notes_sqlite.list_notes()
 
 def search_notes(query: str, top_k: int = 5) -> list[dict]:
-    return notes_sqlite(query, top_k)
+    return notes_sqlite.search_notes(query, top_k)
 
 def read_notes(note_id: str) -> dict:
     return notes_sqlite.get_note_by_id(note_id)
@@ -15,19 +15,27 @@ def read_notes(note_id: str) -> dict:
 def save_notes(title: str, content: str, *, execution_id: str) -> dict:
     return notes_sqlite.create_note(title, content, execution_id)
 
+def update_notes(note_id: str, title: str, content: str) -> dict:
+    return notes_sqlite.update_note(note_id, title, content)
+
 TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
             "name": "search_notes",
-            "description": "按关键词搜索本地笔记的标题和正文，只返回编号和标题；需要正文时继续调用 read_notes。",
+            "description": "搜索笔记标题和正文，多个关键词用空格分隔，命中任一词即可。返回编号、标题和排序分数（短词补充结果为 null）；需要正文时调用 read_notes。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "搜索关键词，例如 Attention",
-                    }
+                        "description": "搜索关键词，例如 Transformer Attention",
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "最多返回多少条，默认 5",
+                    },
                 },
                 "required": ["query"],
                 "additionalProperties": False,
@@ -95,6 +103,32 @@ TOOL_SCHEMAS = [
                 "additionalProperties": False,
             },
         },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_notes",
+            "description": "更新笔记标题或内容",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "note_id": {
+                        "type": "string",
+                        "description": "笔记的id"
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "笔记的标题"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "笔记的内容"
+                    }
+                },
+                "required": ["note_id", "title", "content"],
+                "additionalProperties": False,
+            },
+        },
     }
 ]
 
@@ -103,4 +137,5 @@ TOOL_HANDLERS = {
     "read_notes": read_notes,
     "remember_preference": memory.remember_preference,
     "save_notes": save_notes,
+    "update_notes": update_notes,
 }
