@@ -2,7 +2,7 @@ import os
 import urllib.request
 import json
 
-def request_llm(messages: list[dict], tools=None) -> dict:
+def request_llm(messages: list[dict], tools=None, request=False, on_text=None) -> dict:
     api_key = os.getenv("LLM_API_KEY")
 
     if not api_key:
