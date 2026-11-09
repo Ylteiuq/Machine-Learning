@@ -2,7 +2,7 @@ import os
 import urllib.request
 import json
 
-def request_llm(messages: list[dict], tools=None, request=False, on_text=None) -> dict:
+def request_llm(messages: list[dict], tools=None, stream=False, on_text=None) -> dict:
     api_key = os.getenv("LLM_API_KEY")
 
     if not api_key:
@@ -14,7 +14,7 @@ def request_llm(messages: list[dict], tools=None, request=False, on_text=None) -
     payload = {
         "model": model,
         "messages": messages,
-        "stream": False,
+        "stream": stream,
         "thinking": {"type": "disabled"},
         "max_tokens": 2048,
     }
@@ -39,4 +39,63 @@ def request_llm(messages: list[dict], tools=None, request=False, on_text=None) -
     )
 
     with urllib.request.urlopen(request, timeout=60) as response:
-        return json.load(response)
+        if not stream:
+            return json.load(response)
+
+        content = ""
+        tool_calls = {}
+        finish_reason = None
+        usage = {}
+
+        for line in response:
+            line = line.decode("utf-8").strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+
+            chunk = json.loads(data)
+            if chunk.get("usage") is not None:
+                usage = chunk["usage"]
+            if not chunk.get("choices"):
+                continue
+
+            choice = chunk["choices"][0]
+            delta = choice.get("delta", {})
+            text = delta.get("content") or ""
+            if text:
+                content += text
+                if on_text is not None:
+                    on_text(text)
+
+            # 同一个工具调用会分多次到达，用 index 找到它，再拼接参数。
+            for fragment in delta.get("tool_calls") or []:
+                index = fragment["index"]
+                if index not in tool_calls:
+                    tool_calls[index] = {
+                        "id": "",
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    }
+                call = tool_calls[index]
+                if fragment.get("id"):
+                    call["id"] = fragment["id"]
+                function = fragment.get("function") or {}
+                call["function"]["name"] += function.get("name") or ""
+                call["function"]["arguments"] += function.get("arguments") or ""
+
+            if choice.get("finish_reason") is not None:
+                finish_reason = choice["finish_reason"]
+
+        if finish_reason is None:
+            raise RuntimeError("流式响应未返回结束原因")
+
+        # 对 Agent Loop 仍返回一条完整消息，工具参数由 execute_tool 解析。
+        message = {"role": "assistant", "content": content}
+        if tool_calls:
+            message["tool_calls"] = [tool_calls[i] for i in sorted(tool_calls)]
+        return {
+            "choices": [{"message": message, "finish_reason": finish_reason}],
+            "usage": usage,
+        }

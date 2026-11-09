@@ -100,19 +100,21 @@ class AgentStatus(Enum):
     MAX_STEPS = auto()
     INCOMPLETE = auto()
 
-def step(state: dict) -> None:
+def step(state: dict, on_text=None) -> None:
     """原地推进一次模型请求或一个工具批次；终止后不再推进。"""
     messages = state["messages"]
     if state["phase"] == "model":
         state["model_calls"] += 1
         response = request.request_llm(context.build_context(
             messages, state.get("summary", ""), state.get("summarized_until", 0)
-        ), tools.TOOL_SCHEMAS)
+        ), tools.TOOL_SCHEMAS, stream=on_text is not None, on_text=on_text)
         choice = response["choices"][0]
         message = choice["message"]
         finish_reason = choice["finish_reason"]
 
         messages.append(message)
+        if on_text is not None and message.get("content"):
+            print()
         print(f"第 {state['model_calls']} 次模型调用：", finish_reason, response.get("usage", {}))
 
         # 被截断或异常终止的响应不能算完成，也不能执行其中可能残缺的工具请求。
@@ -160,7 +162,7 @@ def step(state: dict) -> None:
 
 
 def run_agent(messages: list[dict], max_steps: int = 6, resume: bool = False,
-              session: dict = None) -> tuple[AgentStatus, list[dict]]:
+              session: dict = None, on_text=None) -> tuple[AgentStatus, list[dict]]:
     """维护传入的消息历史；max_steps 限制模型调用次数，而非工具调用次数。"""
     if type(max_steps) is not int or max_steps < 1:
         raise ValueError("max_steps 必须是正整数")
@@ -194,7 +196,7 @@ def run_agent(messages: list[dict], max_steps: int = 6, resume: bool = False,
             # 预算只阻止下一次模型请求；已收到的工具请求仍执行完。
             if state["phase"] == "model" and state["model_calls"] >= max_steps:
                 return AgentStatus.MAX_STEPS, messages
-            step(state)
+            step(state, on_text=on_text)
             checkpoint.save_checkpoint(state)
 
         if state["phase"] == "done":
@@ -202,6 +204,8 @@ def run_agent(messages: list[dict], max_steps: int = 6, resume: bool = False,
         return AgentStatus.INCOMPLETE, messages
     except Exception as error:
         # 工具的预期业务错误已转成 tool 消息；其余运行失败在任务边界终止。
+        if on_text is not None:
+            print()
         print(f"Agent 运行失败（{type(error).__name__}）：{error}")
         return AgentStatus.INCOMPLETE, messages
 
@@ -241,8 +245,16 @@ def main() -> None:
             run_compact(session)
             continue
 
+        streamed = False
+
+        def on_text(text):
+            nonlocal streamed
+            streamed = True
+            print(text, end="", flush=True)
+
         if question == "/resume":
-            status, messages = run_agent(messages, 10, resume=True, session=session)
+            status, messages = run_agent(messages, 10, resume=True, session=session,
+                                         on_text=on_text)
         else:
             message = {
                 "role": "user",
@@ -250,10 +262,12 @@ def main() -> None:
             }
             messages.append(message)
 
-            status, messages = run_agent(messages, 6, session=session)
+            status, messages = run_agent(messages, 6, session=session, on_text=on_text)
 
         if status == AgentStatus.COMPLETE:
-            print(messages[-1]["role"], messages[-1]["content"])
+            # 已完成的 checkpoint 恢复时不会请求模型，仍需展示保存的回答。
+            if not streamed:
+                print(messages[-1]["role"], messages[-1]["content"])
             memory.save_messages(messages, session["summary"], session["summarized_until"])
         elif status == AgentStatus.INCOMPLETE:
             print("Agent 生成未完成或运行失败")
