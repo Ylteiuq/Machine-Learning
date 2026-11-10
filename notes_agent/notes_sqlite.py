@@ -20,6 +20,30 @@ def make_sqlite() -> bool:
             )
         """)
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS note_embeddings (
+                note_id INTEGER NOT NULL,
+                model TEXT NOT NULL,
+                vector TEXT NOT NULL,
+                PRIMARY KEY (note_id, model)
+            )
+        """)
+        # 向量对应旧的标题和正文；笔记改变后先清掉，等重新生成。
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS notes_embedding_update
+            AFTER UPDATE OF title, content ON notes
+            WHEN old.title != new.title OR old.content != new.content
+            BEGIN
+                DELETE FROM note_embeddings WHERE note_id = new.id;
+            END;
+        """)
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS notes_embedding_delete
+            AFTER DELETE ON notes
+            BEGIN
+                DELETE FROM note_embeddings WHERE note_id = old.id;
+            END;
+        """)
+        conn.execute("""
             CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts
             USING fts5(
                 title,
@@ -157,6 +181,39 @@ def list_notes() -> list[dict]:
         conn.row_factory = sqlite3.Row
         rows = conn.execute("SELECT * FROM notes ORDER BY id").fetchall()
         return [_note_dict(row) for row in rows]
+
+
+def save_note_embedding(note_id: str, model: str, vector: list[float]) -> None:
+    """保存一篇笔记的向量；同一模型重新生成时覆盖旧值。"""
+    if not note_id.startswith("n") or not note_id[1:].isdigit():
+        raise ValueError(f"无效的笔记编号: {note_id}")
+    with closing(sqlite3.connect(file_name)) as conn, conn:
+        cursor = conn.execute("""
+            INSERT INTO note_embeddings (note_id, model, vector)
+            SELECT id, ?, ? FROM notes WHERE id = ?
+            ON CONFLICT(note_id, model) DO UPDATE SET vector = excluded.vector
+        """, (model, json.dumps(vector), int(note_id[1:])))
+        if cursor.rowcount == 0:
+            raise ValueError(f"未查询到对应的id: {note_id}")
+
+
+def list_note_embeddings(model: str) -> list[dict]:
+    """只读取同一模型生成的向量，避免混用不同向量空间。"""
+    with closing(sqlite3.connect(file_name)) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT notes.id, notes.title, note_embeddings.vector
+            FROM note_embeddings
+            JOIN notes ON notes.id = note_embeddings.note_id
+            WHERE note_embeddings.model = ?
+            ORDER BY notes.id
+        """, (model,)).fetchall()
+        return [
+            {"id": f"n{row['id']}", "title": row["title"],
+             "vector": json.loads(row["vector"])}
+            for row in rows
+        ]
+
 
 def search_notes(query: str, top_k: int = 5) -> list[dict]:
     """长词按 BM25 排序，短词用子串查询补充；返回可直接读取的笔记编号。"""
