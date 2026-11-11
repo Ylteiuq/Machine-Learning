@@ -1,5 +1,6 @@
 import memory
 import notes_sqlite
+import retrieval
 
 TOOL_PARALLEL = {"search_notes", "read_notes"}
 
@@ -7,7 +8,7 @@ def load_notes() -> list[dict]:
     return notes_sqlite.list_notes()
 
 def search_notes(query: str, top_k: int = 5) -> list[dict]:
-    return notes_sqlite.search_notes(query, top_k)
+    return retrieval.search_notes(query, top_k)
 
 def read_notes(note_id: str) -> dict:
     return notes_sqlite.get_note_by_id(note_id)
