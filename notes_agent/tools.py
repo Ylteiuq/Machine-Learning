@@ -162,3 +162,14 @@ TOOL_HANDLERS = {
     "update_notes": update_notes,
     "delete_notes": delete_notes,
 }
+
+
+def get_tool_schemas(mcp_client=None) -> list[dict]:
+    """接入 MCP 时替换同名的本地定义，其他本地工具保持不变。"""
+    if mcp_client is None:
+        return TOOL_SCHEMAS
+    local_schemas = [
+        schema for schema in TOOL_SCHEMAS
+        if schema["function"]["name"] not in mcp_client.tool_names
+    ]
+    return local_schemas + mcp_client.tool_schemas

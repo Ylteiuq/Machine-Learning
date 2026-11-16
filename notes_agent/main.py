@@ -11,6 +11,7 @@ import memory
 import context
 import checkpoint
 import request
+from mcp_client import connect_notes_server
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
@@ -28,7 +29,7 @@ def find_tool_schemas(tool_name: str, tool_schemas: list[dict]) -> dict:
 
     raise ValueError(f"找不到对应tool: {tool_name}")
 
-def execute_tool(tool_call: dict, run_id: str) -> dict:
+def execute_tool(tool_call: dict, run_id: str, mcp_client=None) -> dict:
     """执行一次工具请求，返回可追加到 messages 的工具消息。"""
 
     tool_id = tool_call["id"]
@@ -36,12 +37,13 @@ def execute_tool(tool_call: dict, run_id: str) -> dict:
     tool_arguments = tool_call["function"]["arguments"]
 
     try:
-        if tool_name not in tools.TOOL_HANDLERS:
+        is_mcp_tool = mcp_client is not None and tool_name in mcp_client.tool_names
+        if not is_mcp_tool and tool_name not in tools.TOOL_HANDLERS:
             raise ValueError(f"未知工具：{tool_name}")
         if not isinstance(tool_arguments, str):
             raise ValueError("工具参数必须是 JSON 字符串")
 
-        parameters = find_tool_schemas(tool_name, tools.TOOL_SCHEMAS)
+        parameters = find_tool_schemas(tool_name, tools.get_tool_schemas(mcp_client))
         arguments = json.loads(tool_arguments)
         if not isinstance(arguments, dict):
             raise ValueError("工具参数必须解析为一个对象")
@@ -64,13 +66,17 @@ def execute_tool(tool_call: dict, run_id: str) -> dict:
                     raise ValueError(f"参数 {field} 必须是非空字符串")
 
         # 实际调用也放在 try 中，read_notes 抛出的业务错误才能回传给模型。
-        func = tools.TOOL_HANDLERS[tool_name]
-        if tool_name == "save_notes":
-            # 内部执行标识由运行时注入，不由模型提供。
-            arguments["execution_id"] = f"{run_id}:{tool_id}"
+        if is_mcp_tool:
+            data = mcp_client.call_tool(tool_name, arguments)
+        else:
+            func = tools.TOOL_HANDLERS[tool_name]
+            if tool_name == "save_notes":
+                # 内部执行标识由运行时注入，不由模型提供。
+                arguments["execution_id"] = f"{run_id}:{tool_id}"
+            data = func(**arguments)
         result = {
             "ok": True,
-            "data": func(**arguments),
+            "data": data,
         }
     except json.JSONDecodeError:
         result = {"ok": False, "error": "工具参数不是有效的 JSON"}
@@ -84,13 +90,13 @@ def execute_tool(tool_call: dict, run_id: str) -> dict:
         "content": json.dumps(result, ensure_ascii=False),
     }
 
-def execute_tool_batch(tool_calls: list[dict], run_id: str) -> list[dict]:
+def execute_tool_batch(tool_calls: list[dict], run_id: str, mcp_client=None) -> list[dict]:
     """执行调度好的批次：单个工具直接执行，多个读取工具最多两路并行。"""
     if len(tool_calls) == 1:
-        return [execute_tool(tool_calls[0], run_id)]
+        return [execute_tool(tool_calls[0], run_id, mcp_client)]
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [executor.submit(execute_tool, call, run_id) for call in tool_calls]
+        futures = [executor.submit(execute_tool, call, run_id, mcp_client) for call in tool_calls]
         # 先全部提交，再按请求顺序收集；结果顺序不受完成先后影响。
         return [future.result() for future in futures]
 
@@ -100,14 +106,14 @@ class AgentStatus(Enum):
     MAX_STEPS = auto()
     INCOMPLETE = auto()
 
-def step(state: dict, on_text=None) -> None:
+def step(state: dict, on_text=None, mcp_client=None) -> None:
     """原地推进一次模型请求或一个工具批次；终止后不再推进。"""
     messages = state["messages"]
     if state["phase"] == "model":
         state["model_calls"] += 1
         response = request.request_llm(context.build_context(
             messages, state.get("summary", ""), state.get("summarized_until", 0)
-        ), tools.TOOL_SCHEMAS, stream=on_text is not None, on_text=on_text)
+        ), tools.get_tool_schemas(mcp_client), stream=on_text is not None, on_text=on_text)
         choice = response["choices"][0]
         message = choice["message"]
         finish_reason = choice["finish_reason"]
@@ -151,8 +157,10 @@ def step(state: dict, on_text=None) -> None:
             batch = state["pending_tools"][:1]
 
         for tool_call in batch:
-            print("调用工具：", tool_call["function"]["name"], tool_call["function"]["arguments"])
-        results = execute_tool_batch(batch, state["run_id"])
+            name = tool_call["function"]["name"]
+            source = "MCP" if mcp_client is not None and name in mcp_client.tool_names else "本地"
+            print(f"调用工具（{source}）：", name, tool_call["function"]["arguments"])
+        results = execute_tool_batch(batch, state["run_id"], mcp_client)
         # 工作线程不修改状态；整批结果返回后由主线程统一提交。
         messages.extend(results)
         del state["pending_tools"][:len(batch)]
@@ -162,7 +170,7 @@ def step(state: dict, on_text=None) -> None:
 
 
 def run_agent(messages: list[dict], max_steps: int = 6, resume: bool = False,
-              session: dict = None, on_text=None) -> tuple[AgentStatus, list[dict]]:
+              session: dict = None, on_text=None, mcp_client=None) -> tuple[AgentStatus, list[dict]]:
     """维护传入的消息历史；max_steps 限制模型调用次数，而非工具调用次数。"""
     if type(max_steps) is not int or max_steps < 1:
         raise ValueError("max_steps 必须是正整数")
@@ -196,7 +204,7 @@ def run_agent(messages: list[dict], max_steps: int = 6, resume: bool = False,
             # 预算只阻止下一次模型请求；已收到的工具请求仍执行完。
             if state["phase"] == "model" and state["model_calls"] >= max_steps:
                 return AgentStatus.MAX_STEPS, messages
-            step(state, on_text=on_text)
+            step(state, on_text=on_text, mcp_client=mcp_client)
             checkpoint.save_checkpoint(state)
 
         if state["phase"] == "done":
@@ -223,7 +231,7 @@ def run_compact(session: dict) -> None:
     session.update(compact)
     print("摘要已保存，最近三轮对话已完整保留。")
 
-def main() -> None:
+def run_cli(mcp_client) -> None:
     session = memory.load_messages()
     messages = session["messages"]
     if not messages:
@@ -254,7 +262,7 @@ def main() -> None:
 
         if question == "/resume":
             status, messages = run_agent(messages, 10, resume=True, session=session,
-                                         on_text=on_text)
+                                         on_text=on_text, mcp_client=mcp_client)
         else:
             message = {
                 "role": "user",
@@ -262,7 +270,8 @@ def main() -> None:
             }
             messages.append(message)
 
-            status, messages = run_agent(messages, 6, session=session, on_text=on_text)
+            status, messages = run_agent(messages, 6, session=session, on_text=on_text,
+                                         mcp_client=mcp_client)
 
         if status == AgentStatus.COMPLETE:
             # 已完成的 checkpoint 恢复时不会请求模型，仍需展示保存的回答。
@@ -275,6 +284,11 @@ def main() -> None:
         elif status == AgentStatus.MAX_STEPS:
             print("达到最大模型调用次数，Agent 已停止，任务尚未完成")
             break
+
+def main() -> None:
+    with connect_notes_server() as mcp_client:
+        run_cli(mcp_client)
+
 
 if __name__ == "__main__":
     main()
