@@ -19,14 +19,7 @@ def make_sqlite() -> bool:
                 execution_id TEXT UNIQUE
             )
         """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS note_embeddings (
-                note_id INTEGER NOT NULL,
-                model TEXT NOT NULL,
-                vector TEXT NOT NULL,
-                PRIMARY KEY (note_id, model)
-            )
-        """)
+
         # 向量对应旧的标题和正文；笔记改变后先清掉，等重新生成。
         conn.execute("""
             CREATE TRIGGER IF NOT EXISTS notes_embedding_update
@@ -105,6 +98,17 @@ def make_sqlite() -> bool:
                 VALUES('rebuild')
             """)
             conn.execute("PRAGMA user_version = 2")
+
+        if conn.execute("PRAGMA user_version").fetchone()[0] < 3:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS note_embeddings (
+                    note_id INTEGER NOT NULL,
+                    model TEXT NOT NULL,
+                    vector TEXT NOT NULL,
+                    PRIMARY KEY (note_id, model)
+                )
+            """)
+            conn.execute("PRAGMA user_version = 3")
     return True
 
 
@@ -211,6 +215,25 @@ def list_note_embeddings(model: str) -> list[dict]:
         return [
             {"id": f"n{row['id']}", "title": row["title"],
              "vector": json.loads(row["vector"])}
+            for row in rows
+        ]
+
+
+def list_unindexed_notes(model: str) -> list[dict]:
+    """返回尚未使用指定模型生成向量的笔记，供后续建立索引。"""
+    with closing(sqlite3.connect(file_name)) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT notes.id, notes.title, notes.content
+            FROM notes
+            LEFT JOIN note_embeddings
+                ON notes.id = note_embeddings.note_id
+                AND note_embeddings.model = ?
+            WHERE note_embeddings.note_id IS NULL
+            ORDER BY notes.id
+        """, (model,)).fetchall()
+        return [
+            {"id": f"n{row['id']}", "title": row["title"], "content": row["content"]}
             for row in rows
         ]
 
