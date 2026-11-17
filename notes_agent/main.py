@@ -11,14 +11,16 @@ import memory
 import context
 import checkpoint
 import request
+import subagent
 from mcp_client import connect_notes_server
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
 SYSTEM_PROMPT = (
     "你是学习笔记助手，使用简洁的中文回答。先搜索本地笔记获取编号；"
-    "回答笔记的具体内容前，使用 read_notes 读取正文。"
+    "回答笔记的具体内容前，由自己或子 Agent 使用 read_notes 读取正文。"
     "依据工具结果回答并标注笔记编号；没有找到时明确说明。"
+    "可将独立的查找、阅读和分析任务交给 delegate_task，再依据子 Agent 报告回答。"
 )
 
 def find_tool_schemas(tool_name: str, tool_schemas: list[dict]) -> dict:
@@ -29,7 +31,7 @@ def find_tool_schemas(tool_name: str, tool_schemas: list[dict]) -> dict:
 
     raise ValueError(f"找不到对应tool: {tool_name}")
 
-def execute_tool(tool_call: dict, run_id: str, mcp_client=None) -> dict:
+def execute_tool(tool_call: dict, run_id: str, mcp_client=None, allowed_tools=None) -> dict:
     """执行一次工具请求，返回可追加到 messages 的工具消息。"""
 
     tool_id = tool_call["id"]
@@ -37,13 +39,15 @@ def execute_tool(tool_call: dict, run_id: str, mcp_client=None) -> dict:
     tool_arguments = tool_call["function"]["arguments"]
 
     try:
+        if allowed_tools is not None and tool_name not in allowed_tools:
+            raise ValueError(f"当前 Agent 不允许调用工具：{tool_name}")
         is_mcp_tool = mcp_client is not None and tool_name in mcp_client.tool_names
-        if not is_mcp_tool and tool_name not in tools.TOOL_HANDLERS:
+        if not is_mcp_tool and tool_name not in tools.TOOL_HANDLERS and tool_name != "delegate_task":
             raise ValueError(f"未知工具：{tool_name}")
         if not isinstance(tool_arguments, str):
             raise ValueError("工具参数必须是 JSON 字符串")
 
-        parameters = find_tool_schemas(tool_name, tools.get_tool_schemas(mcp_client))
+        parameters = find_tool_schemas(tool_name, tools.get_tool_schemas(mcp_client, allowed_tools))
         arguments = json.loads(tool_arguments)
         if not isinstance(arguments, dict):
             raise ValueError("工具参数必须解析为一个对象")
@@ -66,7 +70,12 @@ def execute_tool(tool_call: dict, run_id: str, mcp_client=None) -> dict:
                     raise ValueError(f"参数 {field} 必须是非空字符串")
 
         # 实际调用也放在 try 中，read_notes 抛出的业务错误才能回传给模型。
-        if is_mcp_tool:
+        if tool_name == "delegate_task":
+            data = subagent.delegate_task(
+                **arguments, parent_run_id=run_id, tool_call_id=tool_id,
+                runner=run_agent, mcp_client=mcp_client,
+            )
+        elif is_mcp_tool:
             data = mcp_client.call_tool(tool_name, arguments)
         else:
             func = tools.TOOL_HANDLERS[tool_name]
@@ -90,13 +99,15 @@ def execute_tool(tool_call: dict, run_id: str, mcp_client=None) -> dict:
         "content": json.dumps(result, ensure_ascii=False),
     }
 
-def execute_tool_batch(tool_calls: list[dict], run_id: str, mcp_client=None) -> list[dict]:
+def execute_tool_batch(tool_calls: list[dict], run_id: str, mcp_client=None,
+                       allowed_tools=None) -> list[dict]:
     """执行调度好的批次：单个工具直接执行，多个读取工具最多两路并行。"""
     if len(tool_calls) == 1:
-        return [execute_tool(tool_calls[0], run_id, mcp_client)]
+        return [execute_tool(tool_calls[0], run_id, mcp_client, allowed_tools)]
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [executor.submit(execute_tool, call, run_id, mcp_client) for call in tool_calls]
+        futures = [executor.submit(execute_tool, call, run_id, mcp_client, allowed_tools)
+                   for call in tool_calls]
         # 先全部提交，再按请求顺序收集；结果顺序不受完成先后影响。
         return [future.result() for future in futures]
 
@@ -109,11 +120,12 @@ class AgentStatus(Enum):
 def step(state: dict, on_text=None, mcp_client=None) -> None:
     """原地推进一次模型请求或一个工具批次；终止后不再推进。"""
     messages = state["messages"]
+    allowed_tools = state.get("allowed_tools")
     if state["phase"] == "model":
         state["model_calls"] += 1
         response = request.request_llm(context.build_context(
             messages, state.get("summary", ""), state.get("summarized_until", 0)
-        ), tools.get_tool_schemas(mcp_client), stream=on_text is not None, on_text=on_text)
+        ), tools.get_tool_schemas(mcp_client, allowed_tools), stream=on_text is not None, on_text=on_text)
         choice = response["choices"][0]
         message = choice["message"]
         finish_reason = choice["finish_reason"]
@@ -121,7 +133,8 @@ def step(state: dict, on_text=None, mcp_client=None) -> None:
         messages.append(message)
         if on_text is not None and message.get("content"):
             print()
-        print(f"第 {state['model_calls']} 次模型调用：", finish_reason, response.get("usage", {}))
+        label = "子 Agent" if state.get("parent_run_id") else "主 Agent"
+        print(f"{label}第 {state['model_calls']} 次模型调用：", finish_reason, response.get("usage", {}))
 
         # 被截断或异常终止的响应不能算完成，也不能执行其中可能残缺的工具请求。
         if finish_reason not in {"stop", "tool_calls"}:
@@ -160,7 +173,7 @@ def step(state: dict, on_text=None, mcp_client=None) -> None:
             name = tool_call["function"]["name"]
             source = "MCP" if mcp_client is not None and name in mcp_client.tool_names else "本地"
             print(f"调用工具（{source}）：", name, tool_call["function"]["arguments"])
-        results = execute_tool_batch(batch, state["run_id"], mcp_client)
+        results = execute_tool_batch(batch, state["run_id"], mcp_client, allowed_tools)
         # 工作线程不修改状态；整批结果返回后由主线程统一提交。
         messages.extend(results)
         del state["pending_tools"][:len(batch)]
@@ -170,15 +183,18 @@ def step(state: dict, on_text=None, mcp_client=None) -> None:
 
 
 def run_agent(messages: list[dict], max_steps: int = 6, resume: bool = False,
-              session: dict = None, on_text=None, mcp_client=None) -> tuple[AgentStatus, list[dict]]:
+              session: dict = None, on_text=None, mcp_client=None,
+              checkpoint_path: Path = None, parent_run_id: str = None,
+              allowed_tools=None) -> tuple[AgentStatus, list[dict]]:
     """维护传入的消息历史；max_steps 限制模型调用次数，而非工具调用次数。"""
+    # 主运行默认写 checkpoint.json；子运行由调用方传入自己的保存路径。
     if type(max_steps) is not int or max_steps < 1:
         raise ValueError("max_steps 必须是正整数")
 
     tools.notes_sqlite.make_sqlite()
 
     if resume:
-        state = checkpoint.load_checkpoint()
+        state = checkpoint.load_checkpoint(checkpoint_path)
         messages = state["messages"]
         if session is not None:
             # 同一份历史可能在检查点保存后被 /compact 压缩过。
@@ -190,6 +206,8 @@ def run_agent(messages: list[dict], max_steps: int = 6, resume: bool = False,
     else:
         state = {
             "run_id": uuid.uuid4().hex,
+            "parent_run_id": parent_run_id,
+            "allowed_tools": sorted(allowed_tools) if allowed_tools is not None else None,
             "messages": messages,
             "phase": "model",
             "model_calls": 0,
@@ -197,7 +215,7 @@ def run_agent(messages: list[dict], max_steps: int = 6, resume: bool = False,
             "summary": session["summary"] if session is not None else "",
             "summarized_until": session["summarized_until"] if session is not None else 0,
         }
-        checkpoint.save_checkpoint(state)
+        checkpoint.save_checkpoint(state, checkpoint_path)
 
     try:
         while state["phase"] not in {"done", "failed"}:
@@ -205,7 +223,7 @@ def run_agent(messages: list[dict], max_steps: int = 6, resume: bool = False,
             if state["phase"] == "model" and state["model_calls"] >= max_steps:
                 return AgentStatus.MAX_STEPS, messages
             step(state, on_text=on_text, mcp_client=mcp_client)
-            checkpoint.save_checkpoint(state)
+            checkpoint.save_checkpoint(state, checkpoint_path)
 
         if state["phase"] == "done":
             return AgentStatus.COMPLETE, messages

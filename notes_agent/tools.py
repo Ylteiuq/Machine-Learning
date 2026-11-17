@@ -1,6 +1,7 @@
 import memory
 import notes_sqlite
 import retrieval
+import subagent
 
 TOOL_PARALLEL = {"search_notes", "read_notes"}
 
@@ -163,13 +164,17 @@ TOOL_HANDLERS = {
     "delete_notes": delete_notes,
 }
 
+TOOL_SCHEMAS.append(subagent.TOOL_SCHEMA)
 
-def get_tool_schemas(mcp_client=None) -> list[dict]:
+
+def get_tool_schemas(mcp_client=None, allowed_tools=None) -> list[dict]:
     """接入 MCP 时替换同名的本地定义，其他本地工具保持不变。"""
-    if mcp_client is None:
-        return TOOL_SCHEMAS
-    local_schemas = [
-        schema for schema in TOOL_SCHEMAS
-        if schema["function"]["name"] not in mcp_client.tool_names
-    ]
-    return local_schemas + mcp_client.tool_schemas
+    schemas = TOOL_SCHEMAS
+    if mcp_client is not None:
+        schemas = [
+            schema for schema in schemas
+            if schema["function"]["name"] not in mcp_client.tool_names
+        ] + mcp_client.tool_schemas
+    if allowed_tools is not None:
+        schemas = [schema for schema in schemas if schema["function"]["name"] in allowed_tools]
+    return schemas
