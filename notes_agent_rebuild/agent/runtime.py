@@ -96,6 +96,15 @@ class AgentRuntime:
             send = partial(self.request_for_run, session, run)
             budget = self.model.input_budget
             estimate = self.model.estimate_input_tokens(context, tools_schemas)
+            if self.model.check_context_window(context, tools_schemas):
+                self.emit(run, "超出上下文限制的百分之九十限制，尝试压缩历史")
+                if self.context.compact(session, request=send):
+                    context = self.context.build(session)
+                    self.model.estimate_input_tokens(context, tools_schemas)
+                    if self.context.compact(context, tools_schemas):
+                        self.context(run, "上下文将满，请新建会话")
+                else:
+                    self.emit(run, "上下文压缩失败，请手动尝试压缩") 
             if estimate > budget:
                 self.emit(run, f"预计输入 {estimate} token，超过预算 {budget}，尝试压缩历史")
                 if self.context.compact(session, request=send):

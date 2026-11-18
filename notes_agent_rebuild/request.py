@@ -20,6 +20,10 @@ class LLMClient:
         return self.context_window - self.max_output_tokens
 
     @staticmethod
+    def check_context_window(self, messages, tools=None) -> int:
+        return self.estimate_input_tokens(messages, tools)/self.context_window > 0.9
+
+    @staticmethod
     def estimate_input_tokens(messages, tools=None) -> int:
         """按聊天内容和工具描述近似计数，用于请求前判断预算。"""
         prompt = {"messages": messages}
