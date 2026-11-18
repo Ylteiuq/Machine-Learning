@@ -34,7 +34,7 @@ class Console:
             print(run.error)
 
 
-HELP = "/new 新会话 | /sessions 会话列表 | /use 编号 切换会话 | /history [编号] 查看历史\n/resume 继续未完成任务 | /compact 压缩历史 | /tools 工具列表 | exit 退出"
+HELP = "/new 新会话 | /sessions 会话列表 | /use 编号 切换会话 | /history [编号] 查看历史\n/resume 继续未完成任务 | /compact 压缩历史 | /tools 工具列表 | /usage 使用统计 | exit 退出"
 
 
 def chat(runtime, settings, args, console):
@@ -84,6 +84,15 @@ def chat(runtime, settings, args, console):
                 if session.active_run_id and runtime.runs.get(session.active_run_id).status != RunStatus.COMPLETE:
                     raise ValueError("请先完成当前运行再压缩")
                 print("摘要已保存" if runtime.context.compact(session) else "没有需要压缩的新历史")
+            elif question == "/usage":
+                session = runtime.sessions.get(session.id)
+                if session.active_run_id is None:
+                    print("当前会话暂无运行记录")
+                else:
+                    totals = runtime.runs.totals(session.active_run_id)
+                    print(f"共 {totals['model_calls']} 次，主 Agent {totals['main_calls']} 次，"
+                          f"子 Agent {totals['child_calls']} 次")
+                    print(f"Token 合计 {totals['total_tokens']}，其中子 Agent {totals['child_tokens']}")
             elif question == "/help":
                 print(HELP)
             else:

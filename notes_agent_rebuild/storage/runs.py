@@ -48,8 +48,23 @@ class RunStore:
                 )
                 SELECT runs.id, model_calls, usage FROM runs JOIN tree ON runs.id=tree.id
             """, (run_id,)).fetchall()
+        if not rows:
+            raise ValueError(f"找不到运行：{run_id}")
+
+        total_calls = child_calls = total_tokens = child_tokens = 0
+        for row in rows:
+            calls = row["model_calls"]
+            tokens = json.loads(row["usage"]).get("total_tokens", 0)
+            total_calls += calls
+            total_tokens += tokens
+            if row["id"] != run_id:
+                child_calls += calls
+                child_tokens += tokens
         return {
-            "model_calls": sum(row["model_calls"] for row in rows),
+            "model_calls": total_calls,
+            "main_calls": total_calls - child_calls,
+            "child_calls": child_calls,
             "child_runs": len(rows) - 1,
-            "total_tokens": sum(json.loads(row["usage"]).get("total_tokens", 0) for row in rows),
+            "total_tokens": total_tokens,
+            "child_tokens": child_tokens,
         }
