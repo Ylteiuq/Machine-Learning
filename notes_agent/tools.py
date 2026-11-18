@@ -3,7 +3,7 @@ import notes_sqlite
 import retrieval
 import subagent
 
-TOOL_PARALLEL = {"search_notes", "read_notes"}
+TOOL_PARALLEL = {"search_notes", "read_notes", "delegate_task"}
 
 def load_notes() -> list[dict]:
     return notes_sqlite.list_notes()
