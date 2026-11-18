@@ -1,5 +1,6 @@
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 
 from .context import ContextManager
 from .state import RunState, RunStatus, ToolContext
@@ -79,18 +80,34 @@ class AgentRuntime:
                 self.runs.save(run, conn)
         return self.run(run_id, on_text)
 
+    def request_for_run(self, session, run, messages, tools=None, on_text=None):
+        run.model_calls += 1
+        self.save(session, run)
+        response = self.model.request(messages, tools, stream=on_text is not None, on_text=on_text)
+        usage = response.get("usage") or {}
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            run.usage[key] = run.usage.get(key, 0) + (usage.get(key) or 0)
+        return response
+
     def step(self, session, run, on_text=None) -> None:
         if run.phase == "model":
-            run.model_calls += 1
-            self.save(session, run)
-            response = self.model.request(
-                self.context.build(session), self.registry.schemas(run.allowed_tools),
-                stream=on_text is not None, on_text=on_text,
-            )
+            context = self.context.build(session)
+            tools_schemas = self.registry.schemas(run.allowed_tools)
+            send = partial(self.request_for_run, session, run)
+            budget = self.model.input_budget
+            estimate = self.model.estimate_input_tokens(context, tools_schemas)
+            if estimate > budget:
+                self.emit(run, f"预计输入 {estimate} token，超过预算 {budget}，尝试压缩历史")
+                if self.context.compact(session, request=send):
+                    context = self.context.build(session)
+                    estimate = self.model.estimate_input_tokens(context, tools_schemas)
+                if estimate > budget:
+                    raise ValueError(f"保留的上下文和工具描述约需 {estimate} 个输入 token，预算为 {budget}。请缩短输入或新建会话")
+                if run.model_calls >= run.max_steps:
+                    return  # 摘要用完最后一次请求，交给外层循环暂停，/resume 可继续。
+            response = send(context, tools_schemas, on_text=on_text)
             choice = response["choices"][0]
             message, reason = choice["message"], choice["finish_reason"]
-            for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
-                run.usage[key] = run.usage.get(key, 0) + (response.get("usage") or {}).get(key, 0)
             self.emit(run, f"模型调用 {run.model_calls}，结束原因 {reason}")
             calls = message.get("tool_calls") or []
             if reason not in {"stop", "tool_calls"} or bool(calls) != (reason == "tool_calls"):

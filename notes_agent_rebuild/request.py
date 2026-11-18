@@ -2,13 +2,33 @@
 
 import urllib.request
 import json
+from math import ceil
 
 
 class LLMClient:
-    def __init__(self, api_url: str, api_key: str, model: str):
+    def __init__(self, api_url: str, api_key: str, model: str, context_window: int):
         self.api_url = api_url
         self.api_key = api_key
         self.model = model
+        self.context_window = context_window
+        self.max_output_tokens = 2048
+        if self.context_window <= self.max_output_tokens:
+            raise ValueError("CONTEXT_WINDOW 必须大于预留的 2048 个输出 token")
+
+    @property
+    def input_budget(self) -> int:
+        return self.context_window - self.max_output_tokens
+
+    @staticmethod
+    def estimate_input_tokens(messages, tools=None) -> int:
+        """按聊天内容和工具描述近似计数，用于请求前判断预算。"""
+        prompt = {"messages": messages}
+        if tools:
+            prompt.update(tools=tools, tool_choice="auto")
+        text = json.dumps(prompt, ensure_ascii=False, separators=(",", ":"))
+        ascii_chars = sum(char.isascii() for char in text)
+        # 未绑定特定 tokenizer：ASCII 每 3 个字符约 1 token，其余每个字符按 1.5 估算。
+        return ceil(ascii_chars / 3 + (len(text) - ascii_chars) * 1.5)
 
     def request(self, messages: list[dict], tools=None, stream=False, on_text=None) -> dict:
         api_key = self.api_key
@@ -24,7 +44,7 @@ class LLMClient:
             "messages": messages,
             "stream": stream,
             "thinking": {"type": "disabled"},
-            "max_tokens": 2048,
+            "max_tokens": self.max_output_tokens,
         }
 
         # 先补齐请求体，再编码；编码后的 body 不会随 payload 的修改而变化。

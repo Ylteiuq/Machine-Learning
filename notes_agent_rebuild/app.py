@@ -17,7 +17,7 @@ def create_runtime(settings, via_mcp=False, on_event=None):
     settings.workspace = settings.workspace.resolve()
     settings.workspace.mkdir(parents=True, exist_ok=True)
     database = Database(settings.database)
-    model = LLMClient(settings.api_url, settings.api_key, settings.model)
+    model = LLMClient(settings.api_url, settings.api_key, settings.model, settings.context_window)
     registry = ToolRegistry()
     with ExitStack() as stack:
         if via_mcp:
