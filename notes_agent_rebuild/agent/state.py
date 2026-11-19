@@ -5,9 +5,14 @@ from enum import Enum
 class RunStatus(str, Enum):
     RUNNING = "running"
     COMPLETE = "complete"
+    CANCELLED = "cancelled"
     LIMIT = "limit"
     FAILED = "failed"
     ARCHIVED = "archived"
+
+    @property
+    def finished(self) -> bool:
+        return self in {RunStatus.COMPLETE, RunStatus.CANCELLED}
 
 
 @dataclass

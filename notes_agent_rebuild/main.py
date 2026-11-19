@@ -1,4 +1,7 @@
 import argparse
+import os
+import signal
+from contextlib import contextmanager
 from pathlib import Path
 from threading import Lock
 
@@ -34,7 +37,24 @@ class Console:
             print(run.error)
 
 
-HELP = "/new 新会话 | /sessions 会话列表 | /use 编号 切换会话 | /history [编号] 查看历史\n/resume 继续未完成任务 | /compact 压缩历史 | /tools 工具列表 | /usage 使用统计 | exit 退出"
+HELP = "/new 新会话 | /sessions 会话列表 | /use 编号 切换会话 | /history [编号] 查看历史\n/resume 继续未完成任务 | /compact 压缩历史 | /tools 工具列表 | /usage 使用统计 | Ctrl+C 取消运行 | exit 退出"
+
+
+@contextmanager
+def cancel_on_interrupt():
+    requested = False
+
+    def handle_interrupt(signum, frame):
+        nonlocal requested
+        if not requested:
+            requested = True
+            os.write(2, "\n已请求取消，等待当前步骤结束。\n".encode())
+
+    previous = signal.signal(signal.SIGINT, handle_interrupt)
+    try:
+        yield lambda: requested
+    finally:
+        signal.signal(signal.SIGINT, previous)
 
 
 def chat(runtime, settings, args, console):
@@ -81,7 +101,7 @@ def chat(runtime, settings, args, console):
                 session = runtime.sessions.get(session.id)
                 if session.kind == "legacy":
                     raise ValueError("归档会话只供查看")
-                if session.active_run_id and runtime.runs.get(session.active_run_id).status != RunStatus.COMPLETE:
+                if session.active_run_id and not runtime.runs.get(session.active_run_id).status.finished:
                     raise ValueError("请先完成当前运行再压缩")
                 print("摘要已保存" if runtime.context.compact(session) else "没有需要压缩的新历史")
             elif question == "/usage":
@@ -98,13 +118,15 @@ def chat(runtime, settings, args, console):
             else:
                 console.has_text = False
                 session = runtime.sessions.get(session.id)
-                if question == "/resume":
-                    if not session.active_run_id:
-                        raise ValueError("当前会话没有可恢复的运行")
-                    run = runtime.resume(session.active_run_id, args.max_steps, console.text)
-                else:
-                    run = runtime.create_run(session.id, question, max_steps=args.max_steps)
-                    run = runtime.run(run.id, console.text)
+                with cancel_on_interrupt() as cancel_requested:
+                    if question == "/resume":
+                        if not session.active_run_id:
+                            raise ValueError("当前会话没有可恢复的运行")
+                        run = runtime.resume(session.active_run_id, args.max_steps, console.text,
+                                             cancel_requested=cancel_requested)
+                    else:
+                        run = runtime.create_run(session.id, question, max_steps=args.max_steps)
+                        run = runtime.run(run.id, console.text, cancel_requested=cancel_requested)
                 console.result(runtime, run)
                 if args.task:
                     return 0 if run.status == RunStatus.COMPLETE else 1

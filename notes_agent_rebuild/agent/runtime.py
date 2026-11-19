@@ -31,7 +31,7 @@ class AgentRuntime:
         session = self.sessions.get(session_id)
         if session.kind == "legacy":
             raise ValueError("旧会话是只读归档，请新建通用 Agent 会话")
-        if session.active_run_id and self.runs.get(session.active_run_id).status != RunStatus.COMPLETE:
+        if session.active_run_id and not self.runs.get(session.active_run_id).status.finished:
             raise ValueError("当前任务尚未结束，请先 /resume 或 /new")
         run = RunState(uuid.uuid4().hex, session.id, parent_run_id, call_id,
                        max_steps=max_steps, allowed_tools=sorted(allowed_tools) if allowed_tools is not None else None)
@@ -48,23 +48,34 @@ class AgentRuntime:
             self.sessions.save(session, conn)
             self.runs.save(run, conn)
 
-    def run(self, run_id: str, on_text=None) -> RunState:
+    def run(self, run_id: str, on_text=None, *, cancel_requested=None) -> RunState:
         run = self.runs.get(run_id)
         session = self.sessions.get(run.session_id)
         if run.status == RunStatus.ARCHIVED:
             raise ValueError("旧运行仅供查看，不能用新工具继续执行")
-        if run.status == RunStatus.COMPLETE:
+        if run.status.finished:
             return run
         run.status, run.error = RunStatus.RUNNING, ""
         try:
-            while run.phase != "done":
+            while True:
+                if cancel_requested and cancel_requested():
+                    # 补齐模型发出的工具调用，与取消状态一起提交。
+                    for call in run.pending_tools:
+                        session.messages.append({
+                            "role": "tool", "tool_call_id": call["id"],
+                            "content": '{"ok": false, "error": "用户已取消，此工具未执行"}',
+                        })
+                    run.pending_tools.clear()
+                    run.phase, run.status = "done", RunStatus.CANCELLED
+                    break
+                if run.phase == "done":
+                    run.status = RunStatus.COMPLETE
+                    break
                 if run.phase == "model" and run.model_calls >= run.max_steps:
                     run.status = RunStatus.LIMIT
                     break
-                self.step(session, run, on_text)
+                self.step(session, run, on_text, cancel_requested=cancel_requested)
                 self.save(session, run)
-            if run.phase == "done":
-                run.status = RunStatus.COMPLETE
         except Exception as error:
             run.status = RunStatus.FAILED
             run.error = f"{type(error).__name__}: {error}"
@@ -72,13 +83,16 @@ class AgentRuntime:
         self.save(session, run)
         return run
 
-    def resume(self, run_id: str, additional_steps: int = 6, on_text=None) -> RunState:
+    def resume(self, run_id: str, additional_steps: int = 6, on_text=None, *, cancel_requested=None) -> RunState:
         run = self.runs.get(run_id)
+        if run.status == RunStatus.CANCELLED:
+            with self.database.connect() as conn:
+                self.runs.save(run, conn)
         if run.status in {RunStatus.LIMIT, RunStatus.FAILED}:
             run.max_steps = max(run.max_steps, run.model_calls + additional_steps)
             with self.database.connect() as conn:
                 self.runs.save(run, conn)
-        return self.run(run_id, on_text)
+        return self.run(run_id, on_text, cancel_requested=cancel_requested)
 
     def request_for_run(self, session, run, messages, tools=None, on_text=None):
         run.model_calls += 1
@@ -89,7 +103,7 @@ class AgentRuntime:
             run.usage[key] = run.usage.get(key, 0) + (usage.get(key) or 0)
         return response
 
-    def step(self, session, run, on_text=None) -> None:
+    def step(self, session, run, on_text=None, *, cancel_requested=None) -> None:
         if run.phase == "model":
             context = self.context.build(session)
             tools_schemas = self.registry.schemas(run.allowed_tools)
@@ -113,6 +127,9 @@ class AgentRuntime:
                         remaining = self.model.estimate_input_tokens(context, tools_schemas)
                         self.emit(run, f"已压缩历史：预计输入 {estimate} → {remaining} token，预算 {budget}")
                         estimate = remaining
+            # 自动摘要也是一次模型调用，结束后先处理取消，再考虑发下一次请求。
+            if cancel_requested and cancel_requested():
+                return
             if estimate > budget:
                 raise ValueError(f"保留的上下文和工具描述约需 {estimate} 个输入 token，预算为 {budget}。请缩短输入或新建会话")
             if run.model_calls >= run.max_steps:
