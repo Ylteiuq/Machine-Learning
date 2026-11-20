@@ -58,6 +58,9 @@ class AgentRuntime:
         run.status, run.error = RunStatus.RUNNING, ""
         try:
             while True:
+                if run.phase == "done":
+                    run.status = RunStatus.COMPLETE
+                    break
                 if cancel_requested and cancel_requested():
                     # 补齐模型发出的工具调用，与取消状态一起提交。
                     for call in run.pending_tools:
@@ -67,9 +70,6 @@ class AgentRuntime:
                         })
                     run.pending_tools.clear()
                     run.phase, run.status = "done", RunStatus.CANCELLED
-                    break
-                if run.phase == "done":
-                    run.status = RunStatus.COMPLETE
                     break
                 if run.phase == "model" and run.model_calls >= run.max_steps:
                     run.status = RunStatus.LIMIT
@@ -85,13 +85,23 @@ class AgentRuntime:
 
     def resume(self, run_id: str, additional_steps: int = 6, on_text=None, *, cancel_requested=None) -> RunState:
         run = self.runs.get(run_id)
+        if run.status not in {RunStatus.CANCELLED, RunStatus.LIMIT, RunStatus.FAILED}:
+            return self.run(run_id, on_text, cancel_requested=cancel_requested)
+        session = self.sessions.get(run.session_id)
+        if session.active_run_id != run.id:
+            raise ValueError("会话已有新任务，只能恢复当前任务")
         if run.status == RunStatus.CANCELLED:
-            with self.database.connect() as conn:
-                self.runs.save(run, conn)
-        if run.status in {RunStatus.LIMIT, RunStatus.FAILED}:
-            run.max_steps = max(run.max_steps, run.model_calls + additional_steps)
-            with self.database.connect() as conn:
-                self.runs.save(run, conn)
+            last = session.messages[-1]
+            # 旧记录可能在完整答复落库后才被标记为取消。
+            if last["role"] == "assistant" and not last.get("tool_calls"):
+                run.status = RunStatus.COMPLETE
+                self.save(session, run)
+                return run
+            if last["role"] != "user":
+                session.messages.append({"role": "user", "content": "继续刚才的任务，参考已有工具结果完成剩余工作。"})
+            run.status, run.phase = RunStatus.RUNNING, "model"
+        run.max_steps = max(run.max_steps, run.model_calls + additional_steps)
+        self.save(session, run)
         return self.run(run_id, on_text, cancel_requested=cancel_requested)
 
     def request_for_run(self, session, run, messages, tools=None, on_text=None):
