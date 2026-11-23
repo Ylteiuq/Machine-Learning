@@ -1,6 +1,8 @@
+import json
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
+from queue import Empty, Queue
 
 from .context import ContextManager
 from .state import RunState, RunStatus, ToolContext
@@ -49,7 +51,28 @@ class AgentRuntime:
             self.sessions.save(session, conn)
             self.runs.save(run, conn)
 
-    def run(self, run_id: str, on_text=None, *, cancel_requested=None) -> RunState:
+    @staticmethod
+    def skip_pending_tools(session, run, reason):
+        for call in run.pending_tools:
+            session.messages.append({
+                "role": "tool", "tool_call_id": call["id"],
+                "content": json.dumps({"ok": False, "error": reason}, ensure_ascii=False),
+            })
+        run.pending_tools.clear()
+
+    def apply_steering(self, session, run, steering: Queue) -> None:
+        while True:
+            try:
+                instruction = steering.get_nowait()
+            except Empty:
+                return
+            self.skip_pending_tools(session, run, "用户补充了指令，此工具未执行")
+            session.messages.append({"role": "user", "content": instruction})
+            run.phase = "model"
+            self.save(session, run)
+            self.emit(run, "已加入补充指令")
+
+    def run(self, run_id: str, on_text=None, *, cancel_requested=None, steering=None) -> RunState:
         run = self.runs.get(run_id)
         session = self.sessions.get(run.session_id)
         if run.status == RunStatus.ARCHIVED:
@@ -59,6 +82,8 @@ class AgentRuntime:
         run.status, run.error = RunStatus.RUNNING, ""
         try:
             while True:
+                if steering is not None:
+                    self.apply_steering(session, run, steering)
                 if run.phase == "done":
                     run.status = RunStatus.COMPLETE
                     break
@@ -70,13 +95,7 @@ class AgentRuntime:
                 self.step(session, run, on_text, cancel_requested=cancel_requested)
                 self.save(session, run)
         except RequestCancelled:
-            # 补齐已经记入历史、但还没有执行的工具调用。
-            for call in run.pending_tools:
-                session.messages.append({
-                    "role": "tool", "tool_call_id": call["id"],
-                    "content": '{"ok": false, "error": "用户已取消，此工具未执行"}',
-                })
-            run.pending_tools.clear()
+            self.skip_pending_tools(session, run, "用户已取消，此工具未执行")
             run.phase, run.status = "done", RunStatus.CANCELLED
         except Exception as error:
             run.status = RunStatus.FAILED
@@ -85,10 +104,10 @@ class AgentRuntime:
         self.save(session, run)
         return run
 
-    def resume(self, run_id: str, additional_steps: int = 6, on_text=None, *, cancel_requested=None) -> RunState:
+    def resume(self, run_id: str, additional_steps: int = 6, on_text=None, *, cancel_requested=None, steering=None) -> RunState:
         run = self.runs.get(run_id)
         if run.status not in {RunStatus.CANCELLED, RunStatus.LIMIT, RunStatus.FAILED}:
-            return self.run(run_id, on_text, cancel_requested=cancel_requested)
+            return self.run(run_id, on_text, cancel_requested=cancel_requested, steering=steering)
         session = self.sessions.get(run.session_id)
         if session.active_run_id != run.id:
             raise ValueError("会话已有新任务，只能恢复当前任务")
@@ -104,7 +123,7 @@ class AgentRuntime:
             run.status, run.phase = RunStatus.RUNNING, "model"
         run.max_steps = max(run.max_steps, run.model_calls + additional_steps)
         self.save(session, run)
-        return self.run(run_id, on_text, cancel_requested=cancel_requested)
+        return self.run(run_id, on_text, cancel_requested=cancel_requested, steering=steering)
 
     def request_for_run(self, session, run, messages, tools=None, on_text=None, *, cancel_requested=None):
         run.model_calls += 1

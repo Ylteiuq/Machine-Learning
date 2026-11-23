@@ -1,8 +1,13 @@
 import argparse
 import os
+import select
 import signal
+import sys
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from functools import partial
 from pathlib import Path
+from queue import Empty, Queue
 from threading import Lock
 
 from .agent.state import RunStatus
@@ -37,7 +42,7 @@ class Console:
             print(run.error)
 
 
-HELP = "/new 新会话 | /sessions 会话列表 | /use 编号 切换会话 | /history [编号] 查看历史\n/resume 继续未完成任务 | /compact 压缩历史 | /tools 工具列表 | /usage 使用统计 | Ctrl+C 取消运行 | exit 退出"
+HELP = "/new 新会话 | /sessions 会话列表 | /use 编号 切换会话 | /history [编号] 查看历史\n/resume 继续未完成任务 | /steer 内容 补充运行指令 | /compact 压缩历史 | /tools 工具列表 | /usage 使用统计 | Ctrl+C 取消运行 | exit 退出"
 
 
 @contextmanager
@@ -57,6 +62,54 @@ def cancel_on_interrupt():
         signal.signal(signal.SIGINT, previous)
 
 
+def read_command(prompt=""):
+    if sys.stdin.isatty():
+        return input(prompt).strip()
+    # 管道输入逐行读取，避免提前缓冲后续命令，导致 select 看不到它们。
+    line = sys.stdin.buffer.raw.readline()
+    if not line:
+        raise EOFError
+    return line.decode(sys.stdin.encoding).strip()
+
+
+def run_interactive(execute, run_id, console, cancel_requested):
+    steering = Queue()
+    next_command = None
+    with ThreadPoolExecutor(max_workers=1) as worker:
+        future = worker.submit(execute, cancel_requested=cancel_requested, steering=steering)
+        try:
+            while not future.done():
+                if not select.select([sys.stdin], [], [], 0.1)[0]:
+                    continue
+                try:
+                    command = read_command()
+                except EOFError:
+                    break
+                if not command:
+                    continue
+                parts = command.split(maxsplit=1)
+                if parts[0] == "/steer":
+                    if len(parts) == 2:
+                        steering.put(parts[1])
+                        console.event(run_id, "补充指令已排队")
+                    else:
+                        console.event(run_id, "用法：/steer 补充要求")
+                elif future.done() or not sys.stdin.isatty():
+                    next_command = command
+                    break
+                else:
+                    console.event(run_id, "运行中可输入 /steer 补充要求，或按 Ctrl+C 取消")
+            return future.result(), next_command
+        finally:
+            # 最后一个检查点可能已过去，让用户知道哪些指令来不及应用。
+            while future.done():
+                try:
+                    unused = steering.get_nowait()
+                except Empty:
+                    break
+                console.event(run_id, f"本次运行未采用这条指令：{unused}")
+
+
 def chat(runtime, settings, args, console):
     session = runtime.sessions.get(args.session) if args.session else runtime.sessions.latest(str(settings.workspace))
     if session is None:
@@ -73,9 +126,11 @@ def chat(runtime, settings, args, console):
     session = select(session.id)
     if not args.task:
         print(f"工作目录：{settings.workspace}\n会话：{session.id}\n{HELP}")
+    next_command = None
     while True:
         try:
-            question = args.task or input("你：").strip()
+            question = args.task or next_command or read_command("你：")
+            next_command = None
             if question in {"exit", "/exit"}:
                 return 0
             if not question:
@@ -115,6 +170,8 @@ def chat(runtime, settings, args, console):
                     print(f"Token 合计 {totals['total_tokens']}，其中子 Agent {totals['child_tokens']}")
             elif question == "/help":
                 print(HELP)
+            elif question.split(maxsplit=1)[0] == "/steer":
+                print("/steer 用于正在执行的任务。")
             else:
                 console.has_text = False
                 session = runtime.sessions.get(session.id)
@@ -122,11 +179,16 @@ def chat(runtime, settings, args, console):
                     if question == "/resume":
                         if not session.active_run_id:
                             raise ValueError("当前会话没有可恢复的运行")
-                        run = runtime.resume(session.active_run_id, args.max_steps, console.text,
-                                             cancel_requested=cancel_requested)
+                        run_id = session.active_run_id
+                        execute = partial(runtime.resume, run_id, args.max_steps, console.text)
                     else:
                         run = runtime.create_run(session.id, question, max_steps=args.max_steps)
-                        run = runtime.run(run.id, console.text, cancel_requested=cancel_requested)
+                        run_id = run.id
+                        execute = partial(runtime.run, run_id, console.text)
+                    if args.task:
+                        run = execute(cancel_requested=cancel_requested)
+                    else:
+                        run, next_command = run_interactive(execute, run_id, console, cancel_requested)
                 console.result(runtime, run)
                 if args.task:
                     return 0 if run.status == RunStatus.COMPLETE else 1
