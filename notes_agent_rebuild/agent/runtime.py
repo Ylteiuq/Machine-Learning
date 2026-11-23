@@ -4,6 +4,7 @@ from functools import partial
 
 from .context import ContextManager
 from .state import RunState, RunStatus, ToolContext
+from ..request import RequestCancelled
 from ..storage.runs import RunStore
 from ..storage.sessions import SessionStore
 
@@ -62,20 +63,21 @@ class AgentRuntime:
                     run.status = RunStatus.COMPLETE
                     break
                 if cancel_requested and cancel_requested():
-                    # 补齐模型发出的工具调用，与取消状态一起提交。
-                    for call in run.pending_tools:
-                        session.messages.append({
-                            "role": "tool", "tool_call_id": call["id"],
-                            "content": '{"ok": false, "error": "用户已取消，此工具未执行"}',
-                        })
-                    run.pending_tools.clear()
-                    run.phase, run.status = "done", RunStatus.CANCELLED
-                    break
+                    raise RequestCancelled()
                 if run.phase == "model" and run.model_calls >= run.max_steps:
                     run.status = RunStatus.LIMIT
                     break
                 self.step(session, run, on_text, cancel_requested=cancel_requested)
                 self.save(session, run)
+        except RequestCancelled:
+            # 补齐已经记入历史、但还没有执行的工具调用。
+            for call in run.pending_tools:
+                session.messages.append({
+                    "role": "tool", "tool_call_id": call["id"],
+                    "content": '{"ok": false, "error": "用户已取消，此工具未执行"}',
+                })
+            run.pending_tools.clear()
+            run.phase, run.status = "done", RunStatus.CANCELLED
         except Exception as error:
             run.status = RunStatus.FAILED
             run.error = f"{type(error).__name__}: {error}"
@@ -104,10 +106,11 @@ class AgentRuntime:
         self.save(session, run)
         return self.run(run_id, on_text, cancel_requested=cancel_requested)
 
-    def request_for_run(self, session, run, messages, tools=None, on_text=None):
+    def request_for_run(self, session, run, messages, tools=None, on_text=None, *, cancel_requested=None):
         run.model_calls += 1
         self.save(session, run)
-        response = self.model.request(messages, tools, stream=on_text is not None, on_text=on_text)
+        response = self.model.request(messages, tools, stream=on_text is not None,
+                                      on_text=on_text, cancel_requested=cancel_requested)
         usage = response.get("usage") or {}
         for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
             run.usage[key] = run.usage.get(key, 0) + (usage.get(key) or 0)
@@ -139,12 +142,12 @@ class AgentRuntime:
                         estimate = remaining
             # 自动摘要也是一次模型调用，结束后先处理取消，再考虑发下一次请求。
             if cancel_requested and cancel_requested():
-                return
+                raise RequestCancelled()
             if estimate > budget:
                 raise ValueError(f"保留的上下文和工具描述约需 {estimate} 个输入 token，预算为 {budget}。请缩短输入或新建会话")
             if run.model_calls >= run.max_steps:
                 return  # 摘要用完最后一次请求，交给外层循环暂停，/resume 可继续。
-            response = send(context, tools_schemas, on_text=on_text)
+            response = send(context, tools_schemas, on_text=on_text, cancel_requested=cancel_requested)
             choice = response["choices"][0]
             message, reason = choice["message"], choice["finish_reason"]
             self.emit(run, f"模型调用 {run.model_calls}，结束原因 {reason}")

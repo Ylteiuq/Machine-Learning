@@ -5,6 +5,10 @@ import json
 from math import ceil
 
 
+class RequestCancelled(Exception):
+    """调用方要求停止读取当前响应。"""
+
+
 class LLMClient:
     def __init__(self, api_url: str, api_key: str, model: str, context_window: int):
         self.api_url = api_url
@@ -30,7 +34,7 @@ class LLMClient:
         # 未绑定特定 tokenizer：ASCII 每 3 个字符约 1 token，其余每个字符按 1.5 估算。
         return ceil(ascii_chars / 3 + (len(text) - ascii_chars) * 1.5)
 
-    def request(self, messages: list[dict], tools=None, stream=False, on_text=None) -> dict:
+    def request(self, messages: list[dict], tools=None, stream=False, on_text=None, *, cancel_requested=None) -> dict:
         api_key = self.api_key
 
         if not api_key:
@@ -76,6 +80,8 @@ class LLMClient:
             usage = {}
 
             for line in response:
+                if cancel_requested and cancel_requested():
+                    break
                 line = line.decode("utf-8").strip()
                 if not line.startswith("data:"):
                     continue
@@ -113,10 +119,12 @@ class LLMClient:
                     call["function"]["name"] += function.get("name") or ""
                     call["function"]["arguments"] += function.get("arguments") or ""
 
-                if choice.get("finish_reason") is not None:
+                if choice.get("finish_reason"):
                     finish_reason = choice["finish_reason"]
 
             if finish_reason is None:
+                if cancel_requested and cancel_requested():
+                    raise RequestCancelled()
                 raise RuntimeError("流式响应未返回结束原因")
 
             # 对 Agent Loop 仍返回一条完整消息，工具参数由 execute_tool 解析。
